@@ -1,0 +1,86 @@
+---
+title: "Data_exploration"
+author: "Allen Bush"
+date: "2023-05-30"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+rm(list=ls()) # clear workspace
+
+library(tidyverse)
+library(tidylog)
+library(readxl)
+library(ggtext)
+library(MetBrewer)
+
+
+pest_conc <- read_excel("master_pesticides.xlsx")
+pest_detect <- read_excel("pesticide_detection.xlsx")
+
+
+```
+Code inspired (practically copy-pasted) by Andrew Heiss at: https://www.andrewheiss.com/blog/2022/05/09/hurdle-lognormal-gaussian-brms/#hurdle-lognormal-model
+
+```{r}
+# Use the Johnson color palette
+clrs <- MetBrewer::met.brewer("Johnson")
+
+
+# Custom ggplot theme to make pretty plots
+# Get the font at https://fonts.google.com/specimen/Jost
+theme_nice <- function() {
+  theme_minimal(base_family = "Jost") +
+    theme(panel.grid.minor = element_blank(),
+          plot.title = element_text(family = "Jost", face = "bold"),
+          axis.title = element_text(family = "Jost Medium"),
+          strip.text = element_text(family = "Jost", face = "bold",
+                                    size = rel(1), hjust = 0),
+          strip.background = element_rect(fill = "grey80", color = NA))
+}
+```
+
+
+Data manipulation
+Set up pest_conc concentration in long format rather than having one column per pesticide
+convert nd to zeros, <LOQ to LOD as brms prefers the lower bound of the censored data
+```{r}
+pest_conc_long <- pest_conc %>% pivot_longer(cols = one.naphthol:fludioxonil, names_to = "pesticide", values_to = "recorded_concentration")
+
+pest_master_long <- right_join(pest_conc_long, pest_detect, by = "pesticide") # tidylog says there are duplicates - identify these
+
+sum(duplicated(pest_master_long)) # 0 so tidylog must not be sending the message I thought it was
+
+pest_master_long <- pest_master_long %>%
+  mutate(concentration = as.numeric(ifelse(recorded_concentration == "nd", 0, 
+                                            ifelse(recorded_concentration == "<LOQ", LOD, recorded_concentration))), # NAs introduced by coercion -> from samples in 2013 where recorded_concentration == NA just remove for now
+         status = ifelse(recorded_concentration == "nd", "nd", 
+                                            ifelse(recorded_concentration == "<LOQ", "<LOQ", "quantified"))) %>%
+  drop_na(concentration) %>%
+  mutate(is_zero = concentration == 0)
+
+pest_conc_quant <- subset(pest_master_long, status == "quantified")
+```
+
+
+Proportion of zeros
+```{r}
+pest_master_long %>%
+  #group_by(pesticide) %>%
+  count(is_zero) %>%
+  mutate(prop = n/sum(n))
+```
+
+
+
+Data distribution for quantified pesticides
+```{r}
+pest_conc_quant %>%
+  ggplot() +
+  geom_histogram(aes(x = concentration), binwidth = 0.1) +
+  facet_wrap(~pesticide, scales = "free") +
+  theme_classic()
+```
+

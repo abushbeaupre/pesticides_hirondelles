@@ -1,0 +1,1762 @@
+---
+title: "Understanding the lognormal"
+author: "Allen Bush"
+date: "2023-06-14"
+output: html_document
+---
+
+
+Here, I will explore the parameterization of the lognormal distribution as it is confusing to me
+I will simulate data from a lognormal distribution using the moment matching that Andrew MacDonald has shown me
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+rm(list=ls()) # clear workspace
+
+library(tidyverse)
+library(brms)
+library(cmdstanr)
+library(tidybayes)
+library(ggridges)
+library(tidylog)
+library(readxl)
+library(broom)
+library(posterior)
+library(ggdist)
+library(patchwork)
+
+
+pest_detect <- read_excel("pesticide_detection.xlsx")
+
+```
+
+moment matching functions
+https://discourse.mc-stan.org/t/lognormal-regression-and-moment-matching/26557 
+
+a
+ is the median of the lognormal distribution. Its also the mean of the normal distribution you’d get if you took the log of these lognormal values. 
+b
+ is the standard deviation of those values.
+```{r}
+calculate_a_lnorm <- function(mean, sd){
+
+  log(mean^2/sqrt(sd^2 + mean^2))
+
+}
+
+
+calculate_b_lnorm <- function(mean, sd){
+
+  sqrt(log(sd^2 / mean^2 + 1))
+
+}
+```
+
+#Explore the lognormal with brms
+```{r}
+n <- 2000
+mu <- 7
+sd <- 1
+
+a <- calculate_a_lnorm(mu, sd)
+b <- calculate_b_lnorm(mu, sd)
+
+```
+
+
+Let's take a look at the Gaussian distribution with these parameters and compare with the lognormal
+```{r}
+data <- tibble(
+  y = rnorm(n, mu, sd),
+  log_y = log(y),
+  log_norm = rlnorm(n, a, b),
+  exp_log_norm = exp(log_norm)
+)
+
+y_hist <- ggplot(data) +
+  geom_histogram(aes(x = y)) +
+  geom_vline(xintercept = mean(data$y)) +
+  labs(title = "y")
+
+log_y_hist <- ggplot(data) +
+  geom_histogram(aes(x = log_y)) +
+  geom_vline(xintercept = mean(data$log_y)) +
+  labs(title = "log y")
+
+log_norm_hist <- ggplot(data) +
+  geom_histogram(aes(x = log_norm)) +
+  geom_vline(xintercept = mean(data$log_norm)) +
+  labs(title = "log normal")
+
+exp_log_norm_hist<- ggplot(data) +
+  geom_histogram(aes(x = exp_log_norm)) +
+  geom_vline(xintercept = mean(data$exp_log_norm)) +
+  labs(title = "e ^ log normal")
+
+
+y_hist + log_y_hist + log_norm_hist + exp_log_norm_hist
+
+```
+
+Okay, so the lognormal IS the normal with this moment matching 
+
+Recover parameters
+Gaussian model
+```{r}
+gaussian_model_bf <- bf(y ~ 1,
+                        family = gaussian)
+
+
+get_prior(gaussian_model_bf, data = data)
+
+gaussian_priors <- c(
+  prior(normal(7,1), class = "Intercept"),
+  prior(exponential(1), class = "sigma")
+)
+
+
+gaussian_model <- brm(data = data,
+                      formula = gaussian_model_bf,
+                      prior = gaussian_priors,
+                      sample_prior = "yes",
+                      iter = 2000, warmup = 1000, chains = 4, cores = 4,
+                      seed = 12,
+                      backend = "cmdstanr")
+plot(gaussian_model)
+
+broom.mixed::tidy(gaussian_model)
+
+```
+
+lognormal model
+```{r}
+lognormal_model_bf <- bf(log_norm ~ 1,
+                        family = lognormal)
+
+
+get_prior(lognormal_model_bf, data = data)
+
+#let's go with the default priors for now as I am not sure if the priors are for a and b or mu and sd
+
+lognormal_model <- brm(data = data,
+                      formula = lognormal_model_bf,
+                      sample_prior = "yes",
+                      iter = 2000, warmup = 1000, chains = 4, cores = 4,
+                      seed = 12,
+                      backend = "cmdstanr")
+plot(lognormal_model)
+
+broom.mixed::tidy(lognormal_model)
+
+```
+
+
+Sooooo... brm models parameters a and b
+
+compare model predictions with lognormal data and normal data
+
+```{r}
+predicted_draws <- data %>%
+  add_predicted_draws(lognormal_model, ndraws = 100) 
+
+
+
+ppc_lognormal <- ggplot(predicted_draws) +
+  geom_point(aes(x = .prediction, y = log_norm)) +
+  geom_abline()
+
+ppc_normal <- ggplot(predicted_draws) +
+  geom_point(aes(x = .prediction, y = y)) +
+  geom_abline()
+
+ppc_lognormal + ppc_normal
+
+pp_check(lognormal_model)
+```
+
+The model predictions are on the response scale (the mean mu of the normal distribution)
+
+
+Add predictors
+```{r}
+paysage <- seq(from = -3, to = 3, length.out = n)
+
+mu_pred <- mu + 0.5*paysage
+
+a_pred <- calculate_a_lnorm(mean = mu_pred, sd = sd)
+
+b_pred <- calculate_b_lnorm(mean = mu_pred, sd = sd)
+
+
+data_pred <- tibble(
+  paysage = seq(from = -3, to = 3, length.out = n),
+  log_norm = rlnorm(n, a_pred, b_pred)
+)
+
+ggplot(data_pred, aes(x = paysage, y = log_norm)) +
+  geom_point() +
+  geom_smooth(method = "lm")
+```
+
+Recover parameters
+
+```{r}
+lognormal_pred_bf <- bf(log_norm ~ paysage,
+                        family = lognormal)
+
+
+get_prior(lognormal_pred_bf, data = data_pred)
+
+#let's go with the default priors for now 
+
+lognormal_pred_model <- brm(data = data_pred,
+                      formula = lognormal_pred_bf,
+                      sample_prior = "yes",
+                      iter = 2000, warmup = 1000, chains = 4, cores = 4,
+                      seed = 12,
+                      backend = "cmdstanr")
+plot(lognormal_pred_model)
+pp_check(lognormal_pred_model)
+broom.mixed::tidy(lognormal_pred_model) 
+```
+
+predictions
+
+```{r}
+pred_mean <- data_pred %>%
+  select(paysage) %>%
+  add_epred_draws(lognormal_pred_model, ndraws = 100)
+
+
+epred <- ggplot() + stat_lineribbon(data = pred_mean, aes(x = paysage, y = .epred)) + 
+  geom_point(data = data_pred, aes(x = paysage, y = log_norm), pch = 21, fill = "orange", alpha = 0.2) + 
+  scale_fill_brewer(palette = "Greens", direction = 1)
+
+
+predictions <- data_pred %>%
+  select(paysage) %>%
+  add_predicted_draws(lognormal_pred_model, ndraws = 100)
+
+predictions_plot <- ggplot() + stat_lineribbon(data = predictions, aes(x = paysage, y = .prediction)) + 
+  geom_point(data = data_pred, aes(x = paysage, y = log_norm), pch = 21, fill = "orange", alpha = 0.2) + 
+  scale_fill_brewer(palette = "Greens", direction = 1)
+
+epred + predictions_plot
+```
+
+Okay, so I now understand how to add predictors and the predictions from the model seem to match the simulation
+Now, to understand the value of 0.07 for betapaysage
+
+```{r}
+exp(0.07155) #1.074
+
+```
+
+Maybe a better way to model predictors would be to compute a and b first and then add the effect of the predictors
+
+```{r}
+
+
+data_pred2 <- tibble(
+  paysage = seq(from = -3, to = 3, length.out = n),
+  log_norm = rlnorm(n, a + 0.5*paysage, b_pred)
+)
+
+p1 <- ggplot(data_pred, aes(x = paysage, y = log_norm)) +
+  geom_point() +
+  geom_smooth(method = "lm")
+
+p2 <-ggplot(data_pred2, aes(x = paysage, y = log_norm)) +
+  geom_point() +
+  geom_smooth(method = "lm")
+
+p1 + p2
+```
+
+Adding the predictor on the lognormal scale is actually exponential
+Let's see if 0.07 on the lognormal scale gives the same results as 0.5 on the response scale
+
+```{r}
+data_pred3 <- tibble(
+  paysage = seq(from = -3, to = 3, length.out = n),
+  log_norm = rlnorm(n, a + 0.07*paysage, b_pred)
+)
+
+
+
+p3 <-ggplot(data_pred3, aes(x = paysage, y = log_norm)) +
+  geom_point() +
+  geom_smooth(method = "lm")
+
+p1 + p3
+```
+
+Approximately the same thing
+So, adding a predictor to a rather than mu represents a percentage change on the response scale
+To keep my life simple as the parameterization of the lognormal is extremely weird, I will add predictors on the log scale from now on
+
+
+Let's see if we can recover the parameters for a random effect
+
+```{r}
+n_per_pesticide <- 200
+pesticides <- c(1:20)
+pesticide_deviation <- rnorm(n = length(pesticides), mean = 0, sd = log(1.2)) # pesticides vary by 40% below and above the mean (2*sd)
+
+random_data <- tibble(
+  pesticide_ID = pesticides,
+  pesticide_effect = pesticide_deviation[pesticides]
+) %>% 
+  expand_grid(obs = 1:n_per_pesticide) %>%
+  mutate(log_norm = rlnorm(length(obs), a + pesticide_effect, b_pred))
+```
+
+Model
+```{r}
+lognormal_random_bf <- bf(log_norm ~ (1|pesticide_ID),
+                        family = lognormal)
+
+
+get_prior(lognormal_random_bf, data = random_data)
+
+#let's go with the default priors for now 
+
+lognormal_random_model <- brm(data = random_data,
+                      formula = lognormal_random_bf,
+                      sample_prior = "yes",
+                      iter = 2000, warmup = 1000, chains = 4, cores = 4,
+                      seed = 12,
+                      backend = "cmdstanr")
+plot(lognormal_random_model)
+pp_check(lognormal_random_model)
+print(lognormal_random_model) 
+```
+
+Plot pesticides
+```{r}
+pred_random <- random_data %>%
+  select(pesticide_ID) %>%
+  add_epred_draws(lognormal_random_model, ndraws = 100) %>%
+  ungroup() %>% # by default, dataset is grouped by .row so won't be selected out in the next line of code
+  select(pesticide_ID, .epred)
+
+pred_random_mean<- random_data %>%
+  select(log_norm) %>%
+  add_epred_draws(lognormal_random_model, ndraws = 100, re_formula = NA) %>% # ignore random effect
+  ungroup() %>%
+  mutate(pesticide_ID = "mean") %>%
+  select(pesticide_ID, .epred)
+
+pred_random_full <- rbind(pred_random, pred_random_mean) %>%
+  mutate(pesticide_ID = as.factor(pesticide_ID)) %>%
+  mutate(pesticide_ID = fct_reorder(.f = pesticide_ID, .x = .epred))
+  
+ggplot(data = pred_random_full) +
+  stat_slabinterval(aes(y = .epred, x = pesticide_ID, color = pesticide_ID)) +
+  theme_classic() +
+  theme(legend.position = "none")
+```
+7*1.4 = 9.8
+7/1.4 = 5
+
+Groups vary by 40% around the overall mean
+
+So we now understand how to model random and fixed effects for the lognormal
+
+Now, let's understand how to choose priors
+
+The priors are for the a and b parameters
+
+means should vary on the response scale between zero and nearly 1000
+```{r}
+priorsim <- tibble(
+  mean = rnorm(5000, mean = 500, sd = 250),
+  sdev = rexp(5000, 0.5),
+  a = calculate_a_lnorm(mean, sdev),
+  b = calculate_b_lnorm(mean, sdev)
+) %>% pivot_longer(
+  everything()
+)
+
+
+ggplot(data = priorsim, aes(x = value)) +
+  geom_histogram() +
+  facet_wrap(~name, scales = "free")
+```
+
+So, some wide priors for a and b could be:
+a ~ N(6,2)
+b ~ Exponential(2) aka mean = 1/2
+
+model with priors
+
+going to update lognormal_model;
+lognormal_model_bf <- bf(log_norm ~ 1,
+                        family = lognormal)
+                        
+lognormal_model <- brm(data = data,
+                      formula = lognormal_model_bf,
+                      sample_prior = "yes",
+                      iter = 2000, warmup = 1000, chains = 4, cores = 4,
+                      seed = 12,
+                      backend = "cmdstanr")
+```{r}
+get_prior(lognormal_model_bf, data = data)
+
+lognormal_priors <- c(
+  prior(normal(6,2), class = "Intercept"),
+  prior(exponential(2), class = "sigma")
+)
+
+
+lognormal_model_w_priors <- update(lognormal_model, prior = lognormal_priors) # requires recompiling as the priors have changed but if we did not change the priors, the model would not need to recompile
+
+plot(lognormal_model_w_priors)
+
+broom.mixed::tidy(lognormal_model_w_priors)
+
+```
+
+The model output doesn't really change which is good news as we don't want the priors to have much of an influence
+
+Okay, so the lognormal is definitely weird but we have a method to recover the proper parameters
+
+Now, let's get funky by modeling a hurdle lognormal
+
+The goal of the analysis is to fit a hurdle lognormal model to pesticide concentration data that are left censored under the limit of detection (LOD) and interval censored between LOD and the limit of quantification (LOQ).
+
+We will then explore the effect of varying the proportion of zeros (hu) and the distance between the mean of the distribution and LOQ on the ability of the model to recover the parameters. I hypothesize that the closer the mean is to LOQ, the less precise the model should be as it has practically no observed data on the left side of the mean to infer the censored part of the distribution
+
+We will use LOD and LOQ values for one pesticide (atrazine) and simulate a mean 40% further from LOQ for now
+
+This will be the workflow to complexify the model:
+1) simulate hurdle lognormal uncensored data and recover parameters
+2) simulate lognormal left censored data and recover parameters
+3) simulate lognormal interval censored data and recover parameters
+4) simulate lognormal left + interval censored data and recover parameters
+5) simulate hurdle lognormal left censored data and recover parameters
+6) simulate hurdle lognormal interval censored data and recover parameters
+7) bring it all together and simulate hurdle lognormal left and interval censored data and recover parameters
+
+#1) simulate hurdle lognormal uncensored data and recover parameters
+
+Simulate data
+```{r}
+set.seed(333)
+
+n1 <- 2000 # sample size
+
+atrazine_detect <- pest_detect %>%
+  subset(pesticide == "atrazine") 
+
+hu_atrazine <- 0.75 # probability of zero
+
+dist_from_LOQ_atrazine <- 1.4
+
+mu_atrazine <- atrazine_detect$LOQ * dist_from_LOQ_atrazine # fake atrazine mean, located 40% further from LOQ
+
+sigma_atrazine <- 2
+
+left_censor_atrazine <- atrazine_detect$LOD
+
+interval_censor_atrazine <- atrazine_detect$LOQ
+
+a_atrazine <- calculate_a_lnorm(mean = mu_atrazine, sd = sigma_atrazine)
+
+b_atrazine <- calculate_b_lnorm(mean = mu_atrazine, sd = sigma_atrazine)
+
+
+data_atrazine <- tibble(
+  y = rlnorm(n1, a_atrazine, b_atrazine),
+  hurdle_only = (1 - rbinom(n1, 1, prob = hu_atrazine)) * rlnorm(n1, a_atrazine, b_atrazine)
+)
+
+y_atrazine <- ggplot(data_atrazine) +
+  geom_histogram(aes(x = y), binwidth = 0.1) +
+  geom_vline(xintercept = 0, color = "red")+
+  labs(title = "y")
+
+y_atrazine_hurdle <- ggplot(data_atrazine) +
+  geom_histogram(aes(x = hurdle_only), binwidth = 0.1) +
+  geom_vline(xintercept = 0, color = "red")+
+  labs(title = "hurdle data")
+
+y_atrazine + y_atrazine_hurdle
+```
+
+Recover parameters
+We now need a prior for the probability of zeros (hu)
+
+set up model and simulate from prior only
+```{r}
+hurdle_bf_atrazine <- bf(hurdle_only  ~ 1,
+                           hu ~ 1,
+                           family = "hurdle_lognormal"
+)
+
+get_prior(hurdle_bf_atrazine, data = data_atrazine)
+
+hurdle_prior_atrazine <- c(
+  prior(normal(1.5,1), class = "Intercept", dpar = "hu"), # hu prior is on logit scale (for now)
+  prior(normal(6,2), class = "Intercept"),
+  prior(exponential(2), class = "sigma")
+)
+
+hurdle_mod_atrazine_priors <- brm(data = data_atrazine,
+                      formula = hurdle_bf_atrazine,
+                      prior = hurdle_prior_atrazine,
+                      sample_prior = "only",
+                      iter = 2000, warmup = 1000, chains = 4, cores = 4,
+                      seed = 12,
+                      backend = "cmdstanr")
+
+hurdle_true_values <-  tibble(
+  name = as.factor(c("b_Intercept", "b_hu_Intercept", "sigma")),
+  value = c(a_atrazine, qlogis(hu_atrazine), b_atrazine)
+)
+
+hurdle_prior_draws <- as_draws_df(hurdle_mod_atrazine_priors) %>% select(b_Intercept, b_hu_Intercept, sigma) %>%
+  pivot_longer(c(b_Intercept, b_hu_Intercept, sigma))
+
+
+ggplot() +
+  stat_histinterval(data = hurdle_prior_draws , aes(x = value, y = 0), point_interval = mode_hdi, .width = .95) + 
+  geom_vline(data = hurdle_true_values, aes(xintercept = value), color = "red") +
+  facet_wrap(~name, scales = "free")
+
+```
+
+priors for a and b not great
+change priors
+```{r}
+
+hurdle_prior_atrazine <- c(
+  prior(normal(1.5,1), class = "Intercept", dpar = "hu"), # hu prior is on logit scale (for now)
+  prior(normal(3,4), class = "Intercept"),
+  prior(exponential(0.5), class = "sigma")
+)
+
+hurdle_mod_atrazine_priors <- brm(data = data_atrazine,
+                      formula = hurdle_bf_atrazine,
+                      prior = hurdle_prior_atrazine,
+                      sample_prior = "only",
+                      iter = 2000, warmup = 1000, chains = 4, cores = 4,
+                      seed = 12,
+                      backend = "cmdstanr")
+
+hurdle_prior_draws <- as_draws_df(hurdle_mod_atrazine_priors) %>% select(b_Intercept, b_hu_Intercept, sigma) %>%
+  pivot_longer(c(b_Intercept, b_hu_Intercept, sigma))
+
+
+ggplot() +
+  stat_histinterval(data = hurdle_prior_draws , aes(x = value, y = 0), point_interval = mode_hdi, .width = .95) + 
+  geom_vline(data = hurdle_true_values, aes(xintercept = value), color = "red") +
+  facet_wrap(~name, scales = "free")
+
+```
+
+
+Better
+
+Now model the data
+```{r}
+hurdle_mod_atrazine <- brm(data = data_atrazine,
+                      formula = hurdle_bf_atrazine,
+                      prior = hurdle_prior_atrazine,
+                      sample_prior = "yes",
+                      iter = 2000, warmup = 1000, chains = 4, cores = 4,
+                      seed = 12,
+                      backend = "cmdstanr")
+
+plot(hurdle_mod_atrazine)
+
+broom.mixed::tidy(hurdle_mod_atrazine)
+
+pp_check(hurdle_mod_atrazine)
+
+hurdle_posterior_draws <- as_draws_df(hurdle_mod_atrazine) %>% select(b_Intercept, b_hu_Intercept, sigma) %>%
+  pivot_longer(c(b_Intercept, b_hu_Intercept, sigma))
+
+
+ggplot() +
+  stat_histinterval(data = hurdle_posterior_draws , aes(x = value, y = 0), point_interval = mode_hdi, .width = .95) + 
+  geom_vline(data = hurdle_true_values, aes(xintercept = value), color = "red") +
+  facet_wrap(~name, scales = "free")
+
+
+```
+The model is good to recover the parameters but the ppcheck function isn't really adapted to this sort of distribution
+
+Let's compare the observed observations to the predicted ones
+
+```{r}
+hurdle_predictions <- data_atrazine %>%
+  select(hurdle_only) %>%
+  add_predicted_draws(hurdle_mod_atrazine, ndraws = 100)
+
+ggplot(hurdle_predictions) +
+  geom_point(aes(x = .prediction, y = hurdle_only)) +
+  geom_abline()
+```
+The model expects more extreme values than the actual data
+
+At least it recovers the parameters well though
+
+Since we want to display predictions for the average, it may not be too bad that the model expects more extreme values
+
+Let's move on to left censoring the lognormal
+
+#2) simulate lognormal left censored data and recover parameters
+
+Simulate left censored data (under LOD)
+```{r}
+data_atrazine <- data_atrazine %>%
+  mutate(y_left = ifelse(y < left_censor_atrazine, left_censor_atrazine, y)) %>%
+  mutate(censoring = ifelse(y < left_censor_atrazine, "left", "none")) %>% # need to specify the type of censoring for brms
+  mutate(y_na = ifelse(censoring == "none", y, NA))
+
+y_atrazine <- ggplot(data_atrazine) +
+  geom_histogram(aes(x = y), binwidth = 0.1) +
+  coord_cartesian(xlim = c(0,5)) +
+  labs(title = "y",
+       subtitle = "original data")
+
+y_atrazine_na <- ggplot(data_atrazine) +
+  geom_histogram(aes(x = y_na), binwidth = 0.1) +
+  coord_cartesian(xlim = c(0,5)) +
+  labs(title = "left censored data",
+       subtitle = "the data we see")
+
+y_atrazine_left <- ggplot(data_atrazine) +
+  geom_histogram(aes(x = y_left), binwidth = 0.1) +
+  coord_cartesian(xlim = c(0,5)) +
+  labs(title = "left censored data",
+       subtitle = "the data we feed to brms")
+
+y_atrazine + y_atrazine_left + y_atrazine_na
+```
+
+recover parameters
+```{r}
+left_bf_atrazine <- bf(y_left | cens(censoring) ~ 1,
+                           family = "lognormal"
+)
+
+censoring_prior_atrazine <- c(
+  prior(normal(6,2), class = "Intercept"),
+  prior(exponential(2), class = "sigma")
+)
+
+left_mod_atrazine <- brm(data = data_atrazine,
+                      formula = left_bf_atrazine,
+                      prior = censoring_prior_atrazine,
+                      sample_prior = "yes",
+                      iter = 2000, warmup = 1000, chains = 4, cores = 4,
+                      seed = 12,
+                      backend = "cmdstanr")
+
+plot(left_mod_atrazine)
+
+broom.mixed::tidy(left_mod_atrazine)
+
+pp_check(left_mod_atrazine)
+
+
+censoring_true_values <-  tibble(
+  name = as.factor(c("b_Intercept", "sigma")),
+  value = c(a_atrazine, b_atrazine)
+)
+
+left_posterior_draws <- as_draws_df(left_mod_atrazine) %>% select(b_Intercept, sigma) %>%
+  pivot_longer(c(b_Intercept,  sigma))
+
+
+ggplot() +
+  stat_histinterval(data = left_posterior_draws , aes(x = value, y = 0), point_interval = mode_hdi, .width = .95) + 
+  geom_vline(data = censoring_true_values, aes(xintercept = value), color = "red") +
+  facet_wrap(~name, scales = "free")
+```
+
+Perfect, let's try interval censoring now
+
+#3) simulate lognormal interval censored data and recover parameters
+```{r}
+data_atrazine <- data_atrazine %>%
+  mutate(y_interval = ifelse(y >= left_censor_atrazine & y < interval_censor_atrazine, left_censor_atrazine, y),
+         # every value between LOD and LOQ to LOD (the lower bound)
+         
+         upper_int_cens = ifelse( y >= left_censor_atrazine & y < interval_censor_atrazine, interval_censor_atrazine, y)) %>% 
+  #specify upper bound of interval censoring
+  
+  mutate(censoring_interval = ifelse(y >= left_censor_atrazine & y < interval_censor_atrazine, "interval", "none")) %>% 
+  # need to specify the type of censoring for brms
+  
+  mutate(y_na_interval = ifelse(censoring_interval == "none", y, NA))
+
+
+y_atrazine_na_interval <- ggplot(data_atrazine) +
+  geom_histogram(aes(x = y_na_interval), binwidth = 0.1) +
+  coord_cartesian(xlim = c(0,5)) +
+  labs(title = "interval censored data",
+       subtitle = "the data we see")
+
+y_atrazine_interval <- ggplot(data_atrazine) +
+  geom_histogram(aes(x = y_interval), binwidth = 0.1) +
+  coord_cartesian(xlim = c(0,5)) +
+  labs(title = "interval censored data",
+       subtitle = "the data we feed to brms")
+
+y_atrazine + y_atrazine_interval + y_atrazine_na_interval
+```
+
+Recover parameters
+```{r}
+interval_bf_atrazine <- bf(y_interval | cens(censoring_interval, upper_int_cens) ~ 1, # need to specify the upper bound of interval censoring
+                           family = "lognormal"
+)
+
+interval_mod_atrazine <- brm(data = data_atrazine,
+                      formula = interval_bf_atrazine,
+                      prior = censoring_prior_atrazine,
+                      sample_prior = "yes",
+                      iter = 2000, warmup = 1000, chains = 4, cores = 4,
+                      seed = 12,
+                      backend = "cmdstanr")
+
+plot(interval_mod_atrazine)
+
+broom.mixed::tidy(interval_mod_atrazine)
+
+pp_check(interval_mod_atrazine)
+
+
+interval_posterior_draws <- as_draws_df(interval_mod_atrazine) %>% select(b_Intercept, sigma) %>%
+  pivot_longer(c(b_Intercept,  sigma))
+
+
+ggplot() +
+  stat_histinterval(data = interval_posterior_draws , aes(x = value, y = 0), point_interval = mode_hdi, .width = .95) + 
+  geom_vline(data = censoring_true_values, aes(xintercept = value), color = "red") +
+  facet_wrap(~name, scales = "free")
+```
+Perfect, let's combine both types of censoring
+
+#4) simulate lognormal left + interval censored data and recover parameters
+Simulate data
+```{r}
+data_atrazine <- data_atrazine %>%
+  mutate(y_full_cens = ifelse(y >= left_censor_atrazine & y < interval_censor_atrazine, left_censor_atrazine, 
+                              # every value between LOD and LOQ to LOD (the lower bound)
+                        ifelse(y < left_censor_atrazine, left_censor_atrazine, y))) %>%
+  # every value under LOD to LOD
+  
+  mutate(censoring_full = ifelse(y >= left_censor_atrazine & y < interval_censor_atrazine, "interval", 
+                            ifelse(y < left_censor_atrazine, "left", "none"))) %>% 
+  # specify type of censoring
+  
+  mutate(y_na_full = ifelse(censoring_full == "none", y, NA))
+
+
+y_atrazine_na_full <- ggplot(data_atrazine) +
+  geom_histogram(aes(x = y_na_full), binwidth = 0.1) +
+  coord_cartesian(xlim = c(0,5)) +
+  labs(title = "left + interval censored data",
+       subtitle = "the data we see")
+
+y_atrazine_full<- ggplot(data_atrazine) +
+  geom_histogram(aes(x = y_full_cens), binwidth = 0.1) +
+  coord_cartesian(xlim = c(0,5)) +
+  labs(title = "left + interval censored data",
+       subtitle = "the data we feed to brms")
+
+y_atrazine + y_atrazine_full + y_atrazine_na_full
+```
+
+Recover parameters
+```{r}
+full_cens_bf_atrazine <- bf(y_full_cens | cens(censoring_full, upper_int_cens) ~ 1, # need to specify the upper bound of interval censoring
+                           family = "lognormal"
+)
+
+full_cens_mod_atrazine <- brm(data = data_atrazine,
+                      formula = full_cens_bf_atrazine,
+                      prior = censoring_prior_atrazine,
+                      sample_prior = "yes",
+                      iter = 2000, warmup = 1000, chains = 4, cores = 4,
+                      seed = 12,
+                      backend = "cmdstanr")
+
+plot(full_cens_mod_atrazine)
+
+broom.mixed::tidy(full_cens_mod_atrazine)
+
+pp_check(full_cens_mod_atrazine)
+
+
+full_cens_posterior_draws <- as_draws_df(full_cens_mod_atrazine) %>% select(b_Intercept, sigma) %>%
+  pivot_longer(c(b_Intercept,  sigma))
+
+
+ggplot() +
+  stat_histinterval(data = full_cens_posterior_draws , aes(x = value, y = 0), point_interval = mode_hdi, .width = .95) + 
+  geom_vline(data = censoring_true_values, aes(xintercept = value), color = "red") +
+  facet_wrap(~name, scales = "free")
+```
+Perfect, let's add some hurdling to left censored data
+
+#5) simulate hurdle lognormal left censored data and recover parameters
+```{r}
+data_atrazine <- data_atrazine %>%
+  mutate(y_left_hurdle = ifelse(hurdle_only < left_censor_atrazine, left_censor_atrazine, hurdle_only)) %>%
+  mutate(cens_left_hurdle = ifelse(hurdle_only < left_censor_atrazine, "left", "none")) %>% # need to specify the type of censoring for brms
+  mutate(y_na_left_hurdle = ifelse(cens_left_hurdle == "none", hurdle_only, NA))
+
+
+y_atrazine_na_left_hurdle <- ggplot(data_atrazine) +
+  geom_histogram(aes(x = y_na_left_hurdle), binwidth = 0.1) +
+  coord_cartesian(xlim = c(0,5)) +
+  labs(title = "left + hurdle censored data",
+       subtitle = "the data we see")
+
+y_atrazine_left_hurdle<- ggplot(data_atrazine) +
+  geom_histogram(aes(x = y_left_hurdle), binwidth = 0.1) +
+  coord_cartesian(xlim = c(0,5)) +
+  labs(title = "left + hurdle censored data",
+       subtitle = "the data we feed to brms")
+
+y_atrazine_hurdle <- ggplot(data_atrazine) +
+  geom_histogram(aes(x = hurdle_only), binwidth = 0.1) +
+  coord_cartesian(xlim = c(0,5)) +
+  labs(title = "hurdle data",
+       subtitle = "original hurdle data")
+
+y_atrazine_hurdle + y_atrazine_left_hurdle + y_atrazine_na_left_hurdle
+```
+
+Recover parameters
+```{r}
+hurdle_left_bf_atrazine <- bf(y_left_hurdle | cens(cens_left_hurdle) ~ 1, 
+                              hu ~ 1,
+                              family = "hurdle_lognormal"
+)
+
+hurdle_left_mod_atrazine <- brm(data = data_atrazine,
+                      formula = hurdle_left_bf_atrazine,
+                      prior = hurdle_prior_atrazine, # the priors here have changed to include prior for hu
+                      sample_prior = "yes",
+                      iter = 2000, warmup = 1000, chains = 4, cores = 4,
+                      seed = 12,
+                      backend = "cmdstanr")
+
+plot(hurdle_left_mod_atrazine)
+
+broom.mixed::tidy(hurdle_left_mod_atrazine)
+
+pp_check(hurdle_left_mod_atrazine)
+
+
+left_hurdle_posterior_draws <- as_draws_df(hurdle_left_mod_atrazine) %>% select(b_Intercept, b_hu_Intercept, sigma) %>%
+  pivot_longer(c(b_Intercept, b_hu_Intercept,  sigma))
+
+
+ggplot() +
+  stat_histinterval(data = left_hurdle_posterior_draws , aes(x = value, y = 0), point_interval = mode_hdi, .width = .95) + 
+  geom_vline(data = hurdle_true_values, aes(xintercept = value), color = "red") +
+  facet_wrap(~name, scales = "free")
+```
+
+
+Perfect, let's try interval censored hurdle data
+
+#6) simulate hurdle lognormal interval censored data and recover parameters
+Simulate data
+```{r}
+data_atrazine <- data_atrazine %>%
+  mutate(y_interval_hurdle = ifelse(hurdle_only >= left_censor_atrazine & hurdle_only < interval_censor_atrazine, left_censor_atrazine, hurdle_only),
+         # every value between LOD and LOQ to LOD (the lower bound)
+         
+         upper_int_cens_hurdle = ifelse( hurdle_only >= left_censor_atrazine & hurdle_only < interval_censor_atrazine, interval_censor_atrazine, hurdle_only)) %>% 
+  #specify upper bound of interval censoring
+  
+  mutate(censoring_interval_hurdle = ifelse(hurdle_only >= left_censor_atrazine & hurdle_only < interval_censor_atrazine, "interval", "none")) %>% 
+  # need to specify the type of censoring for brms
+  
+  mutate(y_na_interval_hurdle = ifelse(censoring_interval_hurdle == "none", hurdle_only, NA))
+
+
+y_atrazine_na_interval_hurdle <- ggplot(data_atrazine) +
+  geom_histogram(aes(x = y_na_interval_hurdle), binwidth = 0.1) +
+  coord_cartesian(xlim = c(0,5)) +
+  labs(title = "interval + hurdle censored data",
+       subtitle = "the data we see")
+
+y_atrazine_interval_hurdle<- ggplot(data_atrazine) +
+  geom_histogram(aes(x = y_interval_hurdle), binwidth = 0.1) +
+  coord_cartesian(xlim = c(0,5)) +
+  labs(title = "interval + hurdle censored data",
+       subtitle = "the data we feed to brms")
+
+y_atrazine_hurdle + y_atrazine_interval_hurdle + y_atrazine_na_interval_hurdle
+```
+
+Recover parameters
+```{r}
+hurdle_interval_bf_atrazine <- bf(y_interval_hurdle | cens(censoring_interval_hurdle , upper_int_cens_hurdle) ~ 1, 
+                                  hu ~ 1, 
+                           family = "hurdle_lognormal"
+)
+
+hurdle_interval_mod_atrazine <- brm(data = data_atrazine,
+                      formula = hurdle_interval_bf_atrazine,
+                      prior = hurdle_prior_atrazine, # the priors here have changed to include prior for hu
+                      sample_prior = "yes",
+                      iter = 2000, warmup = 1000, chains = 4, cores = 4,
+                      seed = 12,
+                      backend = "cmdstanr")
+
+plot(hurdle_interval_mod_atrazine)
+
+broom.mixed::tidy(hurdle_interval_mod_atrazine)
+
+pp_check(hurdle_interval_mod_atrazine)
+
+
+interval_hurdle_posterior_draws <- as_draws_df(hurdle_interval_mod_atrazine) %>% select(b_Intercept, b_hu_Intercept, sigma) %>%
+  pivot_longer(c(b_Intercept, b_hu_Intercept,  sigma))
+
+
+ggplot() +
+  stat_histinterval(data = interval_hurdle_posterior_draws , aes(x = value, y = 0), point_interval = mode_hdi, .width = .95) + 
+  geom_vline(data = hurdle_true_values, aes(xintercept = value), color = "red") +
+  facet_wrap(~name, scales = "free")
+```
+
+Perfect, let's bring it all together
+
+#7) bring it all together and simulate hurdle lognormal left and interval censored data and recover parameters
+
+Simulate data
+```{r}
+data_atrazine <- data_atrazine %>%
+  mutate(y_full_hurdle = ifelse(hurdle_only >= left_censor_atrazine & hurdle_only < interval_censor_atrazine, left_censor_atrazine, # every value between LOD and LOQ to LOD (the lower bound)
+                        ifelse(hurdle_only < left_censor_atrazine, left_censor_atrazine, hurdle_only)), # every value under LOD to LOD
+         
+         upper_full_cens_hurdle = ifelse( hurdle_only >= left_censor_atrazine & hurdle_only < interval_censor_atrazine, interval_censor_atrazine, hurdle_only)) %>% #specify upper bound of interval censoring
+  
+  mutate(censoring_full_hurdle = ifelse(hurdle_only >= left_censor_atrazine & hurdle_only < interval_censor_atrazine, "interval", 
+                            ifelse(hurdle_only < left_censor_atrazine, "left", "none"))) %>% # specify type of censoring
+  mutate(y_na_full_hurdle = ifelse(censoring == "none", y, NA))
+
+y_atrazine_na_full_hurdle <- ggplot(data_atrazine) +
+  geom_histogram(aes(x = y_na_full_hurdle), binwidth = 0.1) +
+  coord_cartesian(xlim = c(0,5)) +
+  labs(title = "left + interval + hurdle censored data",
+       subtitle = "the data we see")
+
+y_atrazine_full_hurdle<- ggplot(data_atrazine) +
+  geom_histogram(aes(x = y_full_hurdle), binwidth = 0.1) +
+  coord_cartesian(xlim = c(0,5)) +
+  labs(title = "left + interval + hurdle censored data",
+       subtitle = "the data we feed to brms")
+
+y_atrazine_hurdle + y_atrazine_full_hurdle + y_atrazine_na_full_hurdle
+```
+
+Recover parameters
+```{r}
+hurdle_full_bf_atrazine <- bf(y_full_hurdle | cens(censoring_full_hurdle , upper_full_cens_hurdle) ~ 1, 
+                                  hu ~ 1, 
+                           family = "hurdle_lognormal"
+)
+
+hurdle_full_mod_atrazine <- brm(data = data_atrazine,
+                      formula = hurdle_full_bf_atrazine,
+                      prior = hurdle_prior_atrazine, # the priors here have changed to include prior for hu
+                      sample_prior = "yes",
+                      iter = 2000, warmup = 1000, chains = 4, cores = 4,
+                      seed = 12,
+                      backend = "cmdstanr")
+
+plot(hurdle_full_mod_atrazine)
+
+broom.mixed::tidy(hurdle_full_mod_atrazine)
+
+print(hurdle_full_mod_atrazine)
+
+pp_check(hurdle_full_mod_atrazine)
+
+
+full_hurdle_posterior_draws <- as_draws_df(hurdle_full_mod_atrazine) %>% select(b_Intercept, b_hu_Intercept, sigma) %>%
+  pivot_longer(c(b_Intercept, b_hu_Intercept,  sigma))
+
+
+ggplot() +
+  stat_histinterval(data = full_hurdle_posterior_draws , aes(x = value, y = 0), point_interval = mode_hdi, .width = .95) + 
+  geom_vline(data = hurdle_true_values, aes(xintercept = value), color = "red") +
+  facet_wrap(~name, scales = "free")
+```
+
+Model overestimates prob of hu and parameter a
+
+Let's see what that looks like on the probability and response scales 
+
+```{r}
+full_epred <- data_atrazine %>%
+  select(y_full_hurdle) %>%
+  add_epred_draws(hurdle_full_mod_atrazine, dpar = TRUE, ndraws = 1000) %>%
+  ungroup() %>%
+  select(.epred, hu) %>%
+  pivot_longer(everything())
+
+true_values <- tibble(
+  name = c(".epred", "hu"),
+  value = c(mu_atrazine, hu_atrazine)
+)
+
+ggplot() +
+  stat_histinterval(data = full_epred , aes(x = value, y = 0), point_interval = mode_hdi, .width = .95) + 
+  geom_vline(data = true_values, aes(xintercept = value), color = "red") +
+  facet_wrap(~name, scales = "free")
+  
+  
+
+```
+
+
+
+Let's see if we use sd from the actual data
+
+```{r}
+pest_conc <- read_excel("master_pesticides.xlsx")
+
+pest_conc_long <- pest_conc %>% pivot_longer(cols = one.naphthol:fludioxonil, names_to = "pesticide", values_to = "recorded_concentration")
+
+pest_master_long <- right_join(pest_conc_long, pest_detect, by = "pesticide")
+
+pest_master_long <- pest_master_long %>%
+  mutate(concentration = as.numeric(ifelse(recorded_concentration == "nd", 0, 
+                                            ifelse(recorded_concentration == "<LOQ", LOD, recorded_concentration))), # NAs introduced by coercion -> from samples in 2013 where recorded_concentration == NA just remove for now
+         status = ifelse(recorded_concentration == "nd", "nd", 
+                                            ifelse(recorded_concentration == "<LOQ", "<LOQ", "quantified"))) %>%
+  drop_na(concentration)
+
+
+
+pest_master_long %>%
+  subset(status == "quantified") %>%
+  group_by(pesticide) %>%
+    summarise(sd = sd(concentration),
+              mean = mean(concentration),
+              n = length(concentration))
+```
+
+
+sd for data that was quantified is 27 which is VERY different from the 2 that we used
+
+I think the model has trouble placing data in the zero and concentration parts of the model as most of the mass of the distribution lies in the censored part of the distribution
+
+To continue in this modeling avenue, we would need to simulate different distances between LOQ and the mean (as we already knew)
+
+Okay...
+
+Switch it up
+
+# Alternative modeling method
+What if we try a lognormal truncated at LOD but left censored from LOQ and a separate logistic model for the probability of detection
+
+Workplan:
+1) simulate and recover parameters for lognormal truncated at LOQ
+2) simulate and recover parameters for lognormal truncated at LOD and left censored from LOQ
+
+#1) simulate and recover parameters for lognormal truncated at LOQ
+Simulate data
+need to subset data from the hurdle process as we hypothesise that this is the data generating process
+```{r}
+truncated_data_LOQ <- data_atrazine %>%
+  select(hurdle_only) %>%
+  subset(hurdle_only >= interval_censor_atrazine) %>%
+  mutate(lower_bound = interval_censor_atrazine)
+
+y_atrazine_hurdle_truncated <- ggplot(truncated_data_LOQ) +
+  geom_histogram(aes(x = hurdle_only), binwidth = 0.1) +
+  coord_cartesian(xlim = c(0,5)) +
+  labs(title = "truncated data at LOQ",
+       subtitle = "the data we feed to brms")
+
+y_atrazine_hurdle + y_atrazine_hurdle_truncated
+```
+
+
+Recover parameters
+```{r}
+truncated_bf_atrazine <- bf(hurdle_only| trunc(lb = lower_bound) ~ 1,
+                           family = "lognormal"
+)
+
+
+truncated_mod_atrazine <- brm(data = truncated_data_LOQ,
+                      formula = truncated_bf_atrazine,
+                      prior = censoring_prior_atrazine, # priors shouldn't change
+                      sample_prior = "yes",
+                      iter = 2000, warmup = 1000, chains = 4, cores = 4,
+                      seed = 12,
+                      backend = "cmdstanr")
+
+plot(truncated_mod_atrazine)
+
+broom.mixed::tidy(truncated_mod_atrazine)
+
+pp_check(truncated_mod_atrazine)
+
+truncated_posterior_draws <- as_draws_df(truncated_mod_atrazine) %>% select(b_Intercept, sigma) %>%
+  pivot_longer(c(b_Intercept,  sigma))
+
+
+ggplot() +
+  stat_histinterval(data = truncated_posterior_draws , aes(x = value, y = 0), point_interval = mode_hdi, .width = .95) + 
+  geom_vline(data = censoring_true_values, aes(xintercept = value), color = "red") +
+  facet_wrap(~name, scales = "free")
+```
+
+
+Model overestimates parameter a and underestimates parameter b a bit
+
+Let's try with left censored data
+
+#2) simulate and recover parameters for lognormal truncated at LOD and left censored from LOQ
+
+Simulate data
+Need to subset hurdle data with LOD
+
+```{r}
+truncated_data_LOD <- data_atrazine %>%
+  select(hurdle_only) %>%
+  subset(hurdle_only >= left_censor_atrazine) %>%
+  mutate(lower_bound = left_censor_atrazine) %>%
+  mutate(y_left = ifelse(hurdle_only < interval_censor_atrazine, interval_censor_atrazine, hurdle_only)) %>%
+  mutate(censoring = ifelse(hurdle_only < interval_censor_atrazine, "left", "none")) %>% # need to specify the type of censoring for brms
+  mutate(y_na = ifelse(censoring == "none", hurdle_only, NA))
+  
+
+y_atrazine_censored_truncated <- ggplot(truncated_data_LOD) +
+  geom_histogram(aes(x = hurdle_only), binwidth = 0.1) +
+  coord_cartesian(xlim = c(0,5)) +
+  labs(title = "truncated data at LOD")
+
+y_atrazine_censored_truncated_brms <- ggplot(truncated_data_LOD) +
+  geom_histogram(aes(x = y_left), binwidth = 0.1) +
+  coord_cartesian(xlim = c(0,5)) +
+  labs(title = "truncated data at LOD",
+       subtitle = "the data we feed brms")
+
+y_atrazine_censored_truncated_na <- ggplot(truncated_data_LOD) +
+  geom_histogram(aes(x = y_na), binwidth = 0.1) +
+  coord_cartesian(xlim = c(0,5)) +
+  labs(title = "truncated data at LOD",
+       subtitle = "the data we see")
+
+y_atrazine_hurdle +  y_atrazine_censored_truncated_brms + y_atrazine_censored_truncated_na
+```
+
+Recover parameters
+```{r}
+trunc_cens_bf_atrazine <- bf(y_left| trunc(lb = lower_bound) + cens(censoring) ~ 1,
+                           family = "lognormal"
+)
+
+
+trunc_cens_mod_atrazine <- brm(data = truncated_data_LOD,
+                      formula = trunc_cens_bf_atrazine,
+                      prior = censoring_prior_atrazine, # priors shouldn't change
+                      sample_prior = "yes",
+                      iter = 2000, warmup = 1000, chains = 4, cores = 4,
+                      seed = 12,
+                      backend = "cmdstanr")
+
+print(trunc_cens_mod_atrazine)
+
+plot(truncated_mod_atrazine)
+
+broom.mixed::tidy(truncated_mod_atrazine)
+
+pp_check(truncated_mod_atrazine)
+
+truncated_posterior_draws <- as_draws_df(truncated_mod_atrazine) %>% select(b_Intercept, sigma) %>%
+  pivot_longer(c(b_Intercept,  sigma))
+
+
+ggplot() +
+  stat_histinterval(data = truncated_posterior_draws , aes(x = value, y = 0), point_interval = mode_hdi, .width = .95) + 
+  geom_vline(data = censoring_true_values, aes(xintercept = value), color = "red") +
+  facet_wrap(~name, scales = "free")
+```
+
+Okay... let's put this alternative on the back burner and try setting the mean of the distribution MUCH further from LOQ. Pesticides that were quantified had a mean ranging from 1.4 to 100 times further from LOQ
+
+
+
+#Return to censored hurdle lognormal
+
+define parameters
+```{r}
+set.seed(333)
+
+n1 <- 2000 # sample size
+
+atrazine_detect <- pest_detect %>%
+  subset(pesticide == "atrazine") 
+
+hu_atrazine <- 0.75 # probability of zero
+
+dist_from_LOQ_atrazine2 <- 5
+
+mu_atrazine2 <- atrazine_detect$LOQ * dist_from_LOQ_atrazine2 
+
+sigma_atrazine <- 2
+
+left_censor_atrazine <- atrazine_detect$LOD
+
+interval_censor_atrazine <- atrazine_detect$LOQ
+
+a_atrazine2 <- calculate_a_lnorm(mean = mu_atrazine2, sd = sigma_atrazine) # need to change name
+
+b_atrazine2 <- calculate_b_lnorm(mean = mu_atrazine2, sd = sigma_atrazine)# need to change name
+```
+
+
+Simulate data
+```{r}
+atrazine_sim <- tibble(
+  y = (1 - rbinom(n1, 1, prob = hu_atrazine)) * rlnorm(n1, a_atrazine2, b_atrazine2)
+) %>%
+  mutate(y_cen = ifelse(y >= left_censor_atrazine & y < interval_censor_atrazine, left_censor_atrazine, # every value between LOD and LOQ to LOD (the lower bound)
+                        ifelse(y < left_censor_atrazine, left_censor_atrazine, y)), # every value under LOD to LOD
+         
+         upper_int_cens = ifelse( y >= left_censor_atrazine & y < interval_censor_atrazine, interval_censor_atrazine, y)) %>% #specify upper bound of interval censoring
+  
+  mutate(censoring = ifelse(y >= left_censor_atrazine & y < interval_censor_atrazine, "interval", 
+                            ifelse(y < left_censor_atrazine, "left", "none"))) %>% # specify type of censoring
+  mutate(y_na = ifelse(censoring == "none", y, NA))
+
+
+ggplot(atrazine_sim) +
+  geom_histogram(aes(x = y), binwidth = 0.1) +
+  labs(title = "Censored data")
+
+```
+
+Recover parameters
+```{r}
+hurdle_prior_atrazine <- c(
+  prior(normal(1.5,1), class = "Intercept", dpar = "hu"), # hu prior is on logit scale (for now)
+  prior(normal(3,4), class = "Intercept"),
+  prior(exponential(0.5), class = "sigma")
+)
+
+
+hurdle_full_bf_atrazine2 <- bf(y_cen | cens(censoring , upper_int_cens) ~ 1, 
+                                  hu ~ 1, 
+                           family = "hurdle_lognormal"
+)
+
+hurdle_full_mod_atrazine2 <- brm(data = atrazine_sim,
+                      formula = hurdle_full_bf_atrazine2,
+                      prior = hurdle_prior_atrazine, 
+                      sample_prior = "yes",
+                      iter = 2000, warmup = 1000, chains = 4, cores = 4,
+                      seed = 12,
+                      backend = "cmdstanr")
+
+plot(hurdle_full_mod_atrazine2)
+
+broom.mixed::tidy(hurdle_full_mod_atrazine2)
+
+print(hurdle_full_mod_atrazine2)
+
+pp_check(hurdle_full_mod_atrazine2)
+
+
+hurdle_true_values2 <-  tibble(
+  name = as.factor(c("b_Intercept", "b_hu_Intercept", "sigma")),
+  value = c(a_atrazine2, qlogis(hu_atrazine), b_atrazine2) 
+)
+
+full_hurdle_posterior_draws2 <- as_draws_df(hurdle_full_mod_atrazine2) %>% select(b_Intercept, b_hu_Intercept, sigma) %>%
+  pivot_longer(c(b_Intercept, b_hu_Intercept,  sigma))
+
+
+ggplot() +
+  stat_histinterval(data = full_hurdle_posterior_draws2 , aes(x = value, y = 0), point_interval = mode_hdi, .width = .95) + 
+  geom_vline(data = hurdle_true_values2, aes(xintercept = value), color = "red") +
+  facet_wrap(~name, scales = "free")
+```
+
+
+TAKE THAT!!
+
+Now, let's increase the probability of getting a zero to 90%
+
+```{r}
+hu_atrazine2 <- 0.90
+
+
+atrazine_sim2 <- tibble(
+  y = (1 - rbinom(n1, 1, prob = hu_atrazine2)) * rlnorm(n1, a_atrazine2, b_atrazine2)
+) %>%
+  mutate(y_cen = ifelse(y >= left_censor_atrazine & y < interval_censor_atrazine, left_censor_atrazine, # every value between LOD and LOQ to LOD (the lower bound)
+                        ifelse(y < left_censor_atrazine, left_censor_atrazine, y)), # every value under LOD to LOD
+         
+         upper_int_cens = ifelse( y >= left_censor_atrazine & y < interval_censor_atrazine, interval_censor_atrazine, y)) %>% #specify upper bound of interval censoring
+  
+  mutate(censoring = ifelse(y >= left_censor_atrazine & y < interval_censor_atrazine, "interval", 
+                            ifelse(y < left_censor_atrazine, "left", "none"))) %>% # specify type of censoring
+  mutate(y_na = ifelse(censoring == "none", y, NA))
+
+
+ggplot(atrazine_sim2) +
+  geom_histogram(aes(x = y), binwidth = 0.1) +
+  labs(title = "Censored data")
+```
+
+Recover parameters
+```{r}
+
+
+hurdle_full_mod_atrazine3 <- brm(data = atrazine_sim2,
+                      formula = hurdle_full_bf_atrazine2,
+                      prior = hurdle_prior_atrazine, 
+                      sample_prior = "yes",
+                      iter = 2000, warmup = 1000, chains = 4, cores = 4,
+                      seed = 12,
+                      backend = "cmdstanr")
+
+plot(hurdle_full_mod_atrazine3)
+
+broom.mixed::tidy(hurdle_full_mod_atrazine3)
+
+print(hurdle_full_mod_atrazine3)
+
+pp_check(hurdle_full_mod_atrazine3)
+
+hurdle_true_values3 <-  tibble(
+  name = as.factor(c("b_Intercept", "b_hu_Intercept", "sigma")),
+  value = c(a_atrazine2, qlogis(hu_atrazine2), b_atrazine2) 
+)
+full_hurdle_posterior_draws3 <- as_draws_df(hurdle_full_mod_atrazine3) %>% select(b_Intercept, b_hu_Intercept, sigma) %>%
+  pivot_longer(c(b_Intercept, b_hu_Intercept,  sigma))
+
+
+ggplot() +
+  stat_histinterval(data = full_hurdle_posterior_draws3 , aes(x = value, y = 0), point_interval = mode_hdi, .width = .95) + 
+  geom_vline(data = hurdle_true_values3, aes(xintercept = value), color = "red") +
+  facet_wrap(~name, scales = "free")
+```
+
+Would you look at that!
+
+Now let's see how the model behaves with predictors
+
+# Censored hurdle with paysage
+
+
+Simulate paysage effect
+First, paysage affects only the mean
+```{r}
+beta_paysage <- log(1.4)
+
+atrazine_sim_paysage <- tibble(
+  paysage = seq(from = -3, to = 3, length.out = n1),
+  y = (1 - rbinom(n1, 1, prob = hu_atrazine2)) * rlnorm(n1, a_atrazine2 + beta_paysage*paysage, b_atrazine2)
+) %>%
+  mutate(y_cen = ifelse(y >= left_censor_atrazine & y < interval_censor_atrazine, left_censor_atrazine, # every value between LOD and LOQ to LOD (the lower bound)
+                        ifelse(y < left_censor_atrazine, left_censor_atrazine, y)), # every value under LOD to LOD
+         
+         upper_int_cens = ifelse( y >= left_censor_atrazine & y < interval_censor_atrazine, interval_censor_atrazine, y)) %>% #specify upper bound of interval censoring
+  
+  mutate(censoring = ifelse(y >= left_censor_atrazine & y < interval_censor_atrazine, "interval", 
+                            ifelse(y < left_censor_atrazine, "left", "none"))) %>% # specify type of censoring
+  mutate(y_na = ifelse(censoring == "none", y, NA))
+
+ggplot(atrazine_sim_paysage, aes(x = paysage, y = y_na)) +
+  geom_point()
+```
+
+
+Recover parameters
+```{r}
+hurdle_paysage_bf_atrazine <- bf(y_cen | cens(censoring , upper_int_cens) ~ 1 + paysage, 
+                                  hu ~ 1, 
+                           family = "hurdle_lognormal"
+)
+
+
+get_prior(hurdle_paysage_bf_atrazine, data = atrazine_sim_paysage)
+
+hurdle_prior_atrazine_paysage <- c(
+  prior(normal(1.5,1), class = "Intercept", dpar = "hu"), # hu prior is on logit scale (for now)
+  prior(normal(3,4), class = "Intercept"),
+  prior(normal(0,2), class = "b"),
+  prior(exponential(0.5), class = "sigma")
+)
+
+hurdle_paysage_mod_atrazine <- brm(data = atrazine_sim_paysage,
+                      formula = hurdle_paysage_bf_atrazine,
+                      prior = hurdle_prior_atrazine_paysage, 
+                      iter = 2000, warmup = 1000, chains = 4, cores = 4,
+                      seed = 12,
+                      backend = "cmdstanr")
+
+plot(hurdle_paysage_mod_atrazine)
+
+print(hurdle_paysage_mod_atrazine)
+
+pp_check(hurdle_paysage_mod_atrazine)
+
+
+hurdle_true_values <-  tibble(
+  name = as.factor(c("b_Intercept", "b_hu_Intercept", "sigma", "b_paysage")),
+  value = c(a_atrazine2, qlogis(hu_atrazine2), b_atrazine2, beta_paysage) 
+)
+
+full_paysage_posterior_draws <- as_draws_df(hurdle_paysage_mod_atrazine) %>% select(b_Intercept, b_hu_Intercept, sigma, b_paysage) %>%
+  pivot_longer(c(b_Intercept, b_hu_Intercept,  sigma, b_paysage))
+
+
+ggplot() +
+  stat_histinterval(data = full_paysage_posterior_draws , aes(x = value, y = 0), point_interval = mode_hdi, .width = .95) + 
+  geom_vline(data = hurdle_true_values, aes(xintercept = value), color = "red") +
+  facet_wrap(~name, scales = "free")
+```
+
+This works quite well!
+
+Let's add paysage as a predictor for the zero-probability process
+
+In this simulation, I'll make beta_paysage for the mean negative and beta_paysage_hu positive such that as paysage increases, the mean decreases and "presence" decreases 
+
+```{r}
+beta_paysage2 <- log(0.8)
+
+beta_paysage_hu2 <- 0.1
+
+atrazine_sim_paysage2 <- tibble(
+  paysage = seq(from = -3, to = 3, length.out = n1),
+  y = (1 - rbinom(n1, 1, prob = plogis(hu_atrazine2 + beta_paysage_hu2*paysage))) * 
+    rlnorm(n1, a_atrazine2 + beta_paysage2*paysage, b_atrazine2)
+) %>%
+  mutate(y_cen = ifelse(y >= left_censor_atrazine & y < interval_censor_atrazine, left_censor_atrazine, 
+                        # every value between LOD and LOQ to LOD (the lower bound)
+                        ifelse(y < left_censor_atrazine, left_censor_atrazine, y)), 
+         # every value under LOD to LOD
+         
+         upper_int_cens = ifelse( y >= left_censor_atrazine & y < interval_censor_atrazine, interval_censor_atrazine, y)) %>% 
+  #specify upper bound of interval censoring
+  
+  mutate(censoring = ifelse(y >= left_censor_atrazine & y < interval_censor_atrazine, "interval", 
+                            ifelse(y < left_censor_atrazine, "left", "none"))) %>% 
+  # specify type of censoring
+  mutate(y_na = ifelse(censoring == "none", y, NA))
+
+ggplot(atrazine_sim_paysage2, aes(x = paysage, y = y_na)) +
+  geom_point()
+
+ggplot(atrazine_sim_paysage2, aes(x = paysage, y = y)) +
+  geom_point()
+```
+
+
+Recover parameters
+```{r}
+hurdle_paysage_bf_atrazine2 <- bf(y_cen | cens(censoring , upper_int_cens) ~ 1 + paysage, 
+                                  hu ~ 1 + paysage, 
+                           family = "hurdle_lognormal"
+)
+
+
+get_prior(hurdle_paysage_bf_atrazine2, data = atrazine_sim_paysage2)
+
+hurdle_prior_atrazine_paysage2 <- c(
+  prior(normal(1.5,1), class = "Intercept", dpar = "hu"), # hu prior is on logit scale (for now)
+  prior(normal(0,2), class = "b", dpar = "hu"),
+  prior(normal(3,4), class = "Intercept"),
+  prior(normal(0,2), class = "b"),
+  prior(exponential(0.5), class = "sigma")
+)
+
+hurdle_paysage_mod_atrazine2 <- brm(data = atrazine_sim_paysage2,
+                      formula = hurdle_paysage_bf_atrazine2,
+                      prior = hurdle_prior_atrazine_paysage2, 
+                      iter = 2000, warmup = 1000, chains = 4, cores = 4,
+                      seed = 12,
+                      backend = "cmdstanr")
+
+plot(hurdle_paysage_mod_atrazine2)
+
+print(hurdle_paysage_mod_atrazine2)
+
+pp_check(hurdle_paysage_mod_atrazine2)
+
+
+full_paysage_posterior_draws2 <- as_draws_df(hurdle_paysage_mod_atrazine2) %>% select(b_Intercept, b_hu_Intercept, sigma, b_paysage, b_hu_paysage) %>%
+  pivot_longer(c(b_Intercept, b_hu_Intercept, sigma, b_paysage, b_hu_paysage))
+
+hurdle_true_values2 <-  tibble(
+  name = as.factor(c("b_Intercept", "b_hu_Intercept", "sigma", "b_paysage", "b_hu_paysage")),
+  value = c(a_atrazine2, hu_atrazine2, b_atrazine2, beta_paysage2, beta_paysage_hu2) 
+)
+
+ggplot() +
+  stat_histinterval(data = full_paysage_posterior_draws2 , aes(x = value, y = 0), point_interval = mode_hdi, .width = .95) + 
+  geom_vline(data = hurdle_true_values2, aes(xintercept = value), color = "red") +
+  facet_wrap(~name, scales = "free")
+```
+
+The model performs really well
+
+Let's add % cover water
+
+# (PINNED) Censored hurdle with paysage and % cover water
+
+water affects only the mean
+```{r}
+
+beta_paysage2 <- log(0.8)
+
+beta_paysage_hu2 <- 0.1
+
+beta_water <- log(1.4)
+
+atrazine_sim_water <- tibble(
+  paysage = seq(from = -3, to = 3, length.out = n1),
+  water = seq(from = 0, to = 1,  length.out = n1),
+  y = (1 - rbinom(n1, 1, prob = plogis(hu_atrazine2 + beta_paysage_hu2*paysage))) * 
+    rlnorm(n1, a_atrazine2 + beta_paysage2*paysage + beta_water*water, b_atrazine2)
+) %>%
+  mutate(y_cen = ifelse(y >= left_censor_atrazine & y < interval_censor_atrazine, left_censor_atrazine, 
+                        # every value between LOD and LOQ to LOD (the lower bound)
+                        ifelse(y < left_censor_atrazine, left_censor_atrazine, y)), 
+         # every value under LOD to LOD
+         
+         upper_int_cens = ifelse( y >= left_censor_atrazine & y < interval_censor_atrazine, interval_censor_atrazine, y)) %>% 
+  #specify upper bound of interval censoring
+  
+  mutate(censoring = ifelse(y >= left_censor_atrazine & y < interval_censor_atrazine, "interval", 
+                            ifelse(y < left_censor_atrazine, "left", "none"))) %>% 
+  # specify type of censoring
+  mutate(y_na = ifelse(censoring == "none", y, NA))
+
+ggplot(atrazine_sim_water, aes(x = paysage, y = y_na)) +
+  geom_point()
+
+ggplot(atrazine_sim_water, aes(x = water, y = y_na)) +
+  geom_point()
+
+ggplot(atrazine_sim_water, aes(x = paysage, y = y)) +
+  geom_point()
+
+ggplot(atrazine_sim_water, aes(x = water, y = y)) +
+  geom_point()
+```
+
+
+Recover parameters
+```{r}
+hurdle_water_bf_atrazine <- bf(y_cen | cens(censoring , upper_int_cens) ~ 1 + paysage + water, 
+                                  hu ~ 1 + paysage, 
+                           family = "hurdle_lognormal"
+)
+
+
+get_prior(hurdle_water_bf_atrazine, data = atrazine_sim_water)
+
+hurdle_prior_atrazine_water <- c(
+  prior(normal(1.5,1), class = "Intercept", dpar = "hu"), # hu prior is on logit scale (for now)
+  prior(normal(0,2), class = "b", dpar = "hu"),
+  prior(normal(3,4), class = "Intercept"),
+  prior(normal(0,2), class = "b"),
+  prior(exponential(0.5), class = "sigma")
+)
+
+hurdle_paysage_mod_water <- brm(data = atrazine_sim_water,
+                      formula = hurdle_water_bf_atrazine,
+                      prior = hurdle_prior_atrazine_water, 
+                      iter = 2000, warmup = 1000, chains = 4, cores = 4,
+                      seed = 12,
+                      backend = "cmdstanr")
+
+plot(hurdle_paysage_mod_water)
+
+print(hurdle_paysage_mod_water)
+
+
+
+water_posterior_draws <- as_draws_df(hurdle_paysage_mod_water) %>% select(b_Intercept, b_hu_Intercept, sigma, b_paysage, b_hu_paysage, b_water) %>%
+  pivot_longer(c(b_Intercept, b_hu_Intercept, sigma, b_paysage, b_hu_paysage, b_water))
+
+hurdle_true_values3 <-  tibble(
+  name = as.factor(c("b_Intercept", "b_hu_Intercept", "sigma", "b_paysage", "b_hu_paysage", "b_water")),
+  value = c(a_atrazine2, hu_atrazine2, b_atrazine2, beta_paysage2, beta_paysage_hu2, beta_water) 
+)
+
+ggplot() +
+  stat_histinterval(data = water_posterior_draws , aes(x = value, y = 0), point_interval = mode_hdi, .width = .95) + 
+  geom_vline(data = hurdle_true_values3, aes(xintercept = value), color = "red") +
+  facet_wrap(~name, scales = "free")
+```
+
+Hmm...
+
+I think the model is unsure of parameter values due to the predictors not being scaled
+
+# (PINNED) Explore simulating scaled parameters
+
+Let's just see how the model behaves when I scale the predictors for the mean
+
+```{r}
+scaled_water_bf_atrazine <- bf(y_cen | cens(censoring , upper_int_cens) ~ 1 + scale(paysage) + scale(water), 
+                                  hu ~ 1 + paysage, 
+                           family = "hurdle_lognormal"
+)
+
+
+get_prior(scaled_water_bf_atrazine, data = atrazine_sim_water)
+
+hurdle_prior_atrazine_water <- c(
+  prior(normal(1.5,1), class = "Intercept", dpar = "hu"), # hu prior is on logit scale (for now)
+  prior(normal(0,2), class = "b", dpar = "hu"),
+  prior(normal(3,4), class = "Intercept"),
+  prior(normal(0,2), class = "b"),
+  prior(exponential(0.5), class = "sigma")
+)
+
+scaled_paysage_mod_water <- brm(data = atrazine_sim_water,
+                      formula = scaled_water_bf_atrazine,
+                      prior = hurdle_prior_atrazine_water, 
+                      iter = 2000, warmup = 1000, chains = 4, cores = 4,
+                      seed = 12,
+                      backend = "cmdstanr")
+
+plot(scaled_paysage_mod_water)
+
+print(scaled_paysage_mod_water)
+
+
+
+scaled_water_posterior_draws <- as_draws_df(scaled_paysage_mod_water) %>% select(b_Intercept, b_hu_Intercept, sigma, b_scalepaysage, b_hu_paysage, b_scalewater) %>%
+  pivot_longer(c(b_Intercept, b_hu_Intercept, sigma, b_scalepaysage, b_hu_paysage, b_scalewater))
+
+hurdle_true_values3 <-  tibble(
+  name = as.factor(c("b_Intercept", "b_hu_Intercept", "sigma", "b_scalepaysage", "b_hu_paysage", "b_scalewater")),
+  value = c(a_atrazine2, hu_atrazine2, b_atrazine2, beta_paysage2, beta_paysage_hu2, beta_water) 
+)
+
+ggplot() +
+  stat_histinterval(data = scaled_water_posterior_draws , aes(x = value, y = 0), point_interval = mode_hdi, .width = .95) + 
+  geom_vline(data = hurdle_true_values3, aes(xintercept = value), color = "red") +
+  facet_wrap(~name, scales = "free")
+```
+
+
+Let's put a pin in that and try simulating different pesticides with random intercepts and then slopes
+
+Use the LOD and LOQ values for the other pesticides
+# Random effects
+
+##Random intercepts
+
+Paysage affects just the mean
+```{r}
+n_per_pesticide <- 2000
+
+pesticides <- pest_detect %>% mutate(pesticide_num = as.numeric(as.factor(pesticide))) %>% select(pesticide_num)
+
+pesticide_intercepts <- rnorm(n = length(pesticides$pesticide_num), mean = 0, sd = log(1.2)) # pesticides vary by 40% below and above the mean (2*sd)
+
+beta_paysage2 <- log(0.8)
+
+
+
+random_intercepts <- tibble(
+  pesticide_ID = pesticides$pesticide_num,
+  pesticide_offset = pesticide_intercepts[pesticides$pesticide_num]
+) %>% 
+  
+  expand_grid(paysage = seq(from = -3, to = 3, length.out = n_per_pesticide)) %>%
+  
+  mutate(y = (1 - rbinom(length(paysage), 1, prob = plogis(hu_atrazine2))) * 
+    rlnorm(length(paysage), a_atrazine2 + beta_paysage2*paysage + pesticide_offset, b_atrazine2)
+) %>%
+  
+  mutate(y_cen = ifelse(y >= left_censor_atrazine & y < interval_censor_atrazine, left_censor_atrazine, 
+                        # every value between LOD and LOQ to LOD (the lower bound)
+                        ifelse(y < left_censor_atrazine, left_censor_atrazine, y)), 
+         # every value under LOD to LOD
+         
+         upper_int_cens = ifelse( y >= left_censor_atrazine & y < interval_censor_atrazine, interval_censor_atrazine, y)) %>% 
+  #specify upper bound of interval censoring
+  
+  mutate(censoring = ifelse(y >= left_censor_atrazine & y < interval_censor_atrazine, "interval", 
+                            ifelse(y < left_censor_atrazine, "left", "none"))) %>% 
+  # specify type of censoring
+  mutate(y_na = ifelse(censoring == "none", y, NA))
+
+
+ggplot(random_intercepts) +
+  geom_smooth(aes(x = paysage, y = y, color = as.factor(pesticide_ID)), method = "lm", se = FALSE) +
+  geom_smooth(aes(x = paysage, y = y), color = "black", method = "lm", se = FALSE, size = 2)
+
+```
+
+
+Recover parameters
+
+```{r}
+random_intercept_bf <- bf(y_cen | cens(censoring , upper_int_cens) ~ 1 + paysage + (1|pesticide_ID), 
+                                  hu ~ 1 + paysage, 
+                           family = "hurdle_lognormal"
+)
+
+
+get_prior(random_intercept_bf, data = random_intercepts)
+
+hurdle_prior_atrazine_water <- c(
+  prior(normal(1.5,1), class = "Intercept", dpar = "hu"), # hu prior is on logit scale (for now)
+  prior(normal(0,2), class = "b", dpar = "hu"),
+  prior(normal(3,4), class = "Intercept"),
+  prior(normal(0,2), class = "b"),
+  prior(exponential(0.5), class = "sigma")
+)
+
+random_intercept_mod <- brm(data = random_intercepts,
+                      formula = random_intercept_bf,
+                      prior = hurdle_prior_atrazine_water, 
+                      iter = 2000, warmup = 1000, chains = 4, cores = 4,
+                      seed = 12,
+                      backend = "cmdstanr")
+
+plot(random_intercept_mod)
+
+print(random_intercept_mod)
+
+
+
+scaled_water_posterior_draws <- as_draws_df(random_intercept_mod) %>% select(b_Intercept, b_hu_Intercept, sigma, b_scalepaysage, b_hu_paysage, b_scalewater) %>%
+  pivot_longer(c(b_Intercept, b_hu_Intercept, sigma, b_scalepaysage, b_hu_paysage, b_scalewater))
+
+hurdle_true_values3 <-  tibble(
+  name = as.factor(c("b_Intercept", "b_hu_Intercept", "sigma", "b_scalepaysage", "b_hu_paysage", "b_scalewater")),
+  value = c(a_atrazine2, hu_atrazine2, b_atrazine2, beta_paysage2, beta_paysage_hu2, beta_water) 
+)
+
+ggplot() +
+  stat_histinterval(data = scaled_water_posterior_draws , aes(x = value, y = 0), point_interval = mode_hdi, .width = .95) + 
+  geom_vline(data = hurdle_true_values3, aes(xintercept = value), color = "red") +
+  facet_wrap(~name, scales = "free")
+```
+
+
+
+
+

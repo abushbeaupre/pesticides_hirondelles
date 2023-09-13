@@ -1,0 +1,510 @@
+---
+title: "simulating partial pooling and censoring"
+author: "Allen Bush"
+date: "2023-02-28"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+rm(list=ls()) # clear workspace
+
+library(tidyverse)
+library(brms)
+library(cmdstanr)
+library(tidybayes)
+library(ggridges)
+library(tidylog)
+library(readxl)
+library(broom)
+library(posterior)
+library(ggdist)
+
+pest_conc <- read_excel("master_pesticides.xlsx")
+pest_detect <- read_excel("pesticide_detection.xlsx")
+
+
+```
+
+Data manipulation
+```{r}
+pest_conc_long <- pest_conc %>% pivot_longer(cols = one.naphthol:fludioxonil, names_to = "pesticide", values_to = "recorded_concentration")
+
+pest_master_long <- right_join(pest_conc_long, pest_detect, by = "pesticide")
+
+pest_master_long <- pest_master_long %>%
+  mutate(concentration = as.numeric(ifelse(recorded_concentration == "nd", 0, 
+                                            ifelse(recorded_concentration == "<LOQ", LOD, recorded_concentration))), # NAs introduced by coercion -> from samples in 2013 where recorded_concentration == NA just remove for now
+         status = ifelse(recorded_concentration == "nd", "nd", 
+                                            ifelse(recorded_concentration == "<LOQ", "<LOQ", "quantified"))) %>%
+  drop_na(concentration)
+
+pest_conc_quant <- subset(pest_master_long, status == "quantified")
+```
+# Part 1. recover parameters from hurdle lognormal for one pesticide, 5 parameter values, different sample sizes
+
+##simulate censored hurdle lognormal for generic pesticide with n = 2000
+```{r}
+set.seed(333)
+
+# sample size
+n1 <- 2000 
+
+# probability of a zero
+pi <- 0.65
+# lognormal mean & sigma
+mu_log <- log(7)
+sigma_log <- log(2)
+
+# simulate data
+y <- (1 - rbinom(n1, 1, prob = pi)) * rlnorm(n1, mu_log, sigma_log)
+
+ggplot(data = tibble(y)) +
+  geom_histogram(aes(y))
+
+```
+
+###adapted from: https://bookdown.org/content/3686/tools-in-the-trunk.html#censored-data-in-jags-brms
+```{r}
+d <- tibble(y = y)
+
+
+# values below 3 are censored
+t1 <- 3
+
+
+d <-
+  d %>% 
+  mutate(y1   = if_else(y < t1, t1, y),
+         cen1 = if_else(y < t1, "left", "none")) %>%
+   mutate(y_na = ifelse(cen1 == "none", y, NA))
+
+d
+```
+
+Histograms
+```{r}
+d %>% 
+  pivot_longer(-cen1) %>% 
+  mutate(name = factor(name, levels = c("y", "y1", "y_na"))) %>% 
+  
+  ggplot(aes(x = value)) +
+  geom_histogram(linewidth = 0.25, binwidth = 1, 
+                 fill = "skyblue4", color = "white") +
+  xlab(NULL) +
+  scale_y_continuous(NULL, breaks = NULL) +
+  facet_wrap(~ name, ncol = 3)
+```
+
+
+Interval censoring from 3 to 5
+```{r}
+t2 <-3
+
+t3 <- 5
+
+
+d <-
+  d %>% 
+  mutate(y2   = if_else(y >= t2 & y < t3, t2, y),
+         y3   = if_else(y >= t2 & y < t3, t3, y),
+         cen2 = if_else(y >= t2 & y < t3, "interval", "none")) %>% 
+  mutate(y_na = ifelse(cen2 == "none", y, NA))%>% 
+  mutate(y4   = if_else(y >= t2 & y < t3, t2, 
+                        if_else(y < t1, t1, y)),
+         y5   = if_else(y >= t2 & y < t3, t3, y),
+         cen3 = if_else(y >= t2 & y < t3, "interval",
+                       if_else(y < t1, "left", "none"))) %>% 
+  mutate(y_na = ifelse(cen3 == "none", y, NA))
+
+d
+```
+
+
+Histograms
+```{r}
+d %>% 
+  pivot_longer(cols = c(y, y4, y5, y_na)) %>% 
+  mutate(name = factor(name, levels = c("y", "y4", "y5", "y_na"))) %>% 
+  
+  ggplot(aes(x = value)) +
+  geom_histogram(linewidth = 0.25, binwidth = 0.5, 
+                 fill = "skyblue4", color = "white") +
+  labs(subtitle = "Our data have been updated, again",
+       x = NULL) +
+  scale_y_continuous(NULL, breaks = NULL) +
+  facet_wrap(~ name, ncol = 2)
+```
+
+
+Model adapted from both previous links - set priors
+```{r}
+cens_hurdle_bf <- bf(y4 | cens(cen3, y5) ~ 1,
+                     hu ~ 1,
+                     family = "hurdle_lognormal"
+                     )
+
+get_prior(cens_hurdle_bf, data = d)
+
+#logistic distribution for hu
+curve(plogis(x), from = -5, to = 5)
+
+cens_hurdle_priors <- c(
+  prior(normal(1,0.5), class = "Intercept", dpar = "hu"),
+  prior(normal(3,1.5), class = "Intercept"),
+  prior(exponential(1), class = "sigma")
+)
+
+prior_predictions <-
+  brm(data = d,
+      formula = cens_hurdle_bf,
+      prior = cens_hurdle_priors,
+      sample_prior = "only",
+      iter = 2000, warmup = 1000, chains = 4, cores = 4,
+      seed = 12,
+      backend = "cmdstanr")
+print(prior_predictions)
+
+d %>% 
+  add_predicted_draws(prior_predictions, ndraws = 6) |> 
+  ggplot(aes(x = y4, y = .prediction)) + geom_point() + facet_wrap(~.draw, scales = "free")
+```
+
+
+Recover parameters
+```{r}
+fit1 <-  brm(data = d,
+      formula = cens_hurdle_bf,
+      prior = cens_hurdle_priors,
+      sample_prior = "yes",
+      iter = 2000, warmup = 1000, chains = 4, cores = 4,
+      seed = 12,
+      backend = "cmdstanr")
+
+print(fit1)
+
+draws<- d %>%
+  add_predicted_draws(fit1, ndraws = 50)
+
+
+hurdle.actualdata <- ggplot(data = draws) +
+  geom_histogram(aes(x = y, y = ..density..),  
+                 fill = "skyblue4", color = "white", binwidth = 1) +
+  geom_density(aes( x = .prediction,  group = .draw),
+            size  = 1/4, alpha = 1/3, color = "lightblue") +
+  labs(title = "Actual Data") +
+  theme_classic()
+hurdle.actualdata
+
+hurdle.censoreddata <- ggplot(data = draws) +
+  geom_histogram(aes(x = y4, y = ..density..),  
+                 fill = "skyblue4", color = "white", binwidth = 1) +
+  geom_density(aes( x = .prediction,  group = .draw),
+            size  = 1/4, alpha = 1/3, color = "lightblue") +
+  labs(title = "Censored Data") +
+  theme_classic()
+
+hurdle.censoreddata 
+
+
+#spread_rvars to recover actual data
+```
+n = 2000 works very well to recover parameters
+2000*probzero(0.65) = 1300 - > 700 actually "measured" points which is quite a lot compared to the actual data
+
+I think we should keep n = 2000 but vary hu between 0.85 to 0.99 (by .1)
+
+First, let's try with values from a real pesticide - Atrazine
+
+
+```{r}
+set.seed(333)
+
+# sample size
+n1 <- 2000 
+atrazine_detect <- pest_detect %>%
+  subset(pesticide == "atrazine")
+hu_atrazine <- 0.9
+dist_from_LOQ_atrazine <- 1.1
+mu_atrazine <- atrazine_detect$LOQ * dist_from_LOQ_atrazine
+sigma_atrazine <- 2
+left_censor_atrazine <- atrazine_detect$LOD
+interval_censor_atrazine <- atrazine_detect$LOQ
+
+# simulate data
+# need to convert every value under LOD to LOD,
+# every value between LOD and LOQ to LOD (the lower bound)
+# need a variable y_upper to specify the upper bound of the interval censoring (LOQ) 
+atrazine_sim <- tibble(
+  y = (1 - rbinom(n1, 1, prob = hu_atrazine)) * rlnorm(n1, mu_atrazine, sigma_atrazine)
+) %>%
+  mutate(y_cen = ifelse(y >= left_censor_atrazine & y < interval_censor_atrazine, left_censor_atrazine, # every value between LOD and LOQ to LOD (the lower bound)
+                        ifelse(y < left_censor_atrazine, left_censor_atrazine, y)), # every value under LOD to LOD
+         
+         upper_int_cens = ifelse( y >= left_censor_atrazine & y < interval_censor_atrazine, interval_censor_atrazine, y)) %>% #specify upper bound of interval censoring
+  
+  mutate(censoring = ifelse(y >= left_censor_atrazine & y < interval_censor_atrazine, "interval", 
+                            ifelse(y < left_censor_atrazine, "left", "none"))) %>% # specify type of censoring
+  mutate(y_na = ifelse(censoring == "none", y, NA))
+
+
+
+atrazine_sim %>% 
+  pivot_longer(cols = c(y, y_cen, upper_int_cens, y_na)) %>% 
+  mutate(name = factor(name, levels = c("y", "y_cen", "upper_int_cens", "y_na"))) %>% 
+  
+  ggplot(aes(x = value)) +
+  geom_histogram(linewidth = 0.25, binwidth = 0.1, 
+                 fill = "skyblue4", color = "white") +
+  labs(x = NULL) +
+  scale_y_continuous(NULL, breaks = NULL) +
+  facet_wrap(~ name, ncol = 2) + 
+  coord_cartesian(xlim = c(0, 10), ylim = c(0,100))
+
+tibble(
+y = rlnorm(n1, mu_atrazine, sigma_atrazine)) %>%
+    ggplot(aes(x = y)) +
+  geom_histogram(linewidth = 0.25, binwidth = 0.1, 
+                 fill = "skyblue4") 
+
+mean(rlnorm(n1, mu_atrazine, sigma_atrazine))
+```
+
+
+
+```{r}
+atrazine_sim2 <- tibble(
+  y = (1 - rbinom(n1, 1, prob = hu_atrazine)) * rlnorm(n1, calculate_a_lnorm(mu_atrazine, sigma_atrazine), calculate_b_lnorm(mu_atrazine, sigma_atrazine))
+) %>%
+  mutate(y_cen = ifelse(y >= left_censor_atrazine & y < interval_censor_atrazine, left_censor_atrazine, # every value between LOD and LOQ to LOD (the lower bound)
+                        ifelse(y < left_censor_atrazine, left_censor_atrazine, y)), # every value under LOD to LOD
+         
+         upper_int_cens = ifelse( y >= left_censor_atrazine & y < interval_censor_atrazine, interval_censor_atrazine, y)) %>% #specify upper bound of interval censoring
+  
+  mutate(censoring = ifelse(y >= left_censor_atrazine & y < interval_censor_atrazine, "interval", 
+                            ifelse(y < left_censor_atrazine, "left", "none"))) %>% # specify type of censoring
+  mutate(y_na = ifelse(censoring == "none", y, NA))
+
+
+atrazine_sim2 %>% 
+  pivot_longer(cols = c(y, y_cen, upper_int_cens, y_na)) %>% 
+  mutate(name = factor(name, levels = c("y", "y_cen", "upper_int_cens", "y_na"))) %>% 
+  
+  ggplot(aes(x = value)) +
+  geom_histogram(linewidth = 0.25, binwidth = 0.1, 
+                 fill = "skyblue4", color = "white") +
+  labs(x = NULL) +
+  scale_y_continuous(NULL, breaks = NULL) +
+  facet_wrap(~ name, ncol = 2) + 
+  coord_cartesian(xlim = c(0, 10), ylim = c(0,100))
+
+```
+
+
+Atrazine model
+Priors
+```{r}
+cens_hurdle_atrazine <- bf(y_cen | cens(censoring, upper_int_cens) ~ 1,
+                           hu ~ 1,
+                           family = "hurdle_lognormal"
+)
+
+get_prior(cens_hurdle_atrazine, data = atrazine_sim)
+
+cens_hurdle_priors <- c(
+  prior(normal(1,0.5), class = "Intercept", dpar = "hu"),
+  prior(normal(3,1.5), class = "Intercept"),
+  prior(exponential(1), class = "sigma")
+)
+
+mod_atrazine_priors <- brm(data = atrazine_sim,
+                      formula = cens_hurdle_atrazine,
+                      family = "hurdle_lognormal",
+                      prior = cens_hurdle_priors,
+                      sample_prior = "only",
+                      iter = 2000, warmup = 1000, chains = 4, cores = 4,
+                      seed = 12,
+                      backend = "cmdstanr")
+
+prior_draws <- as_draws_df(mod_atrazine_priors) %>% select(b_Intercept, b_hu_Intercept, sigma) %>%
+  pivot_longer(c(b_Intercept, b_hu_Intercept, sigma))
+
+true_values <- tibble(
+  name = as.factor(c("b_Intercept", "b_hu_Intercept", "sigma")),
+  value = c(log(mu_atrazine), qlogis(hu_atrazine), log(sigma_atrazine))
+)
+
+
+ggplot() +
+  stat_histinterval(data = prior_draws, aes(x = value, y = 0), point_interval = mode_hdi, .width = .95) + 
+  geom_vline(data = true_values, aes(xintercept = value), color = "red") +
+  facet_wrap(~name, scales = "free")
+# need to make the priors wider for intercept and hu - I know, this is technically cheating
+```
+
+Priors pt.2
+```{r}
+cens_hurdle_priors2 <- c(
+  prior(normal(1.5,1), class = "Intercept", dpar = "hu"),
+  prior(normal(3,3), class = "Intercept"),
+  prior(exponential(1), class = "sigma")
+)
+
+mod_atrazine_priors2 <- brm(data = atrazine_sim,
+                      formula = cens_hurdle_atrazine,
+                      family = "hurdle_lognormal",
+                      prior = cens_hurdle_priors2,
+                      sample_prior = "only",
+                      iter = 2000, warmup = 1000, chains = 4, cores = 4,
+                      seed = 12,
+                      backend = "cmdstanr")
+
+prior_draws2 <- as_draws_df(mod_atrazine_priors2) %>% select(b_Intercept, b_hu_Intercept, sigma) %>%
+  pivot_longer(c(b_Intercept, b_hu_Intercept, sigma))
+
+
+ggplot() +
+  stat_histinterval(data = prior_draws2, aes(x = value, y = 0), point_interval = mode_hdi, .width = .95) + 
+  geom_vline(data = true_values, aes(xintercept = value), color = "red") +
+  facet_wrap(~name, scales = "free")
+
+# okay, this is much better - will have to revise these later
+```
+
+
+
+
+
+
+```{r}
+
+
+mod_atrazine_1 <- brm(data = atrazine_sim,
+                      formula = cens_hurdle_atrazine,
+                      prior = cens_hurdle_priors2,
+                      sample_prior = "yes",
+                      iter = 2000, warmup = 1000, chains = 4, cores = 4,
+                      seed = 12,
+                      backend = "cmdstanr")
+broom.mixed::tidy(mod_atrazine_1)
+
+plot(mod_atrazine_1)
+
+
+```
+
+posterior predictions
+```{r}
+atrazine_draws <- atrazine_sim %>%
+  add_predicted_draws(mod_atrazine_1, ndraws = 100) 
+
+
+
+ggplot(atrazine_draws) +
+  geom_point(aes(x = .prediction, y = y)) +
+  geom_abline()
+
+
+
+posterior_draws <- as_draws_df(mod_atrazine_1) %>% select(b_Intercept, b_hu_Intercept, sigma) %>%
+  pivot_longer(c(b_Intercept, b_hu_Intercept, sigma))
+
+
+ggplot() +
+  stat_histinterval(data = posterior_draws, aes(x = value, y = 0), point_interval = mode_hdi, .width = .95) + 
+  geom_vline(data = true_values, aes(xintercept = value), color = "red") +
+  facet_wrap(~name, scales = "free")
+```
+
+Let's slow down and model the data without censoring
+
+```{r}
+uncens_hurdle_atrazine <- bf(y ~ 1,
+                           hu ~ 1,
+                           family = "hurdle_lognormal"
+)
+
+get_prior(uncens_hurdle_atrazine, data = atrazine_sim)
+
+mod_atrazine_uncensored <- brm(data = atrazine_sim,
+                      formula = uncens_hurdle_atrazine,
+                      family = "hurdle_lognormal",
+                      prior = cens_hurdle_priors2,
+                      sample_prior = "yes",
+                      iter = 2000, warmup = 1000, chains = 4, cores = 4,
+                      seed = 12,
+                      backend = "cmdstanr")
+broom.mixed::tidy(mod_atrazine_uncensored)
+
+plot(mod_atrazine_uncensored)
+```
+
+posterior predictions
+```{r}
+atrazine_draws_uncensored <- atrazine_sim %>%
+  add_predicted_draws(mod_atrazine_uncensored, ndraws = 100) 
+
+
+
+ggplot(atrazine_draws_uncensored) +
+  geom_point(aes(x = .prediction, y = y)) +
+  geom_abline()
+
+
+
+posterior_draws_uncensored <- as_draws_df(mod_atrazine_uncensored) %>% select(b_Intercept, b_hu_Intercept, sigma) %>%
+  pivot_longer(c(b_Intercept, b_hu_Intercept, sigma))
+
+
+ggplot() +
+  stat_histinterval(data = posterior_draws_uncensored, aes(x = value, y = 0), point_interval = mode_hdi, .width = .95) + 
+  geom_vline(data = true_values, aes(xintercept = value), color = "red") +
+  facet_wrap(~name, scales = "free")
+```
+
+
+According to this topic on the stan forum https://discourse.mc-stan.org/t/link-sigma-for-lognormal-family/11026 , the link function only applies to sigma when there are variables used to predict sigma. Otherwise, sigma is on the response scale no matter the link function (?)
+Also, I think that the previous model uses the response scale for the posterior mean of the lognormal. Let's try setting the link to log
+
+```{r}
+uncens_hurdle_atrazine2 <- bf(y ~ 1,
+                           hu ~ 1,
+                           family = hurdle_lognormal(link = "log", link_hu = "logit", link_sigma = "identity")
+)
+
+
+```
+ weird - when data is uncensored, the link needs to be identity
+ Let's see when the data is censored
+ 
+```{r}
+cens_hurdle_atrazine2 <- bf(y_cen | cens(censoring, upper_int_cens) ~ 1,
+                           hu ~ 1,
+                           family = hurdle_lognormal(link = "log", link_sigma = "identity", link_hu = "logit")
+)
+```
+Still doesn't work 
+
+
+```{r}
+cens_hurdle_atrazine3 <- bf(y_cen | cens(censoring, upper_int_cens) ~ 1,
+                           hu ~ 1,
+                           family = hurdle_lognormal(link = "identity", link_sigma = "identity", link_hu = "logit")
+)
+
+
+get_prior(formula = cens_hurdle_atrazine3, data = atrazine_sim)
+
+mod_atrazine_3 <- brm(data = atrazine_sim,
+                      formula = cens_hurdle_atrazine,
+                      prior = cens_hurdle_priors2,
+                      sample_prior = "yes",
+                      iter = 2000, warmup = 1000, chains = 4, cores = 4,
+                      seed = 12,
+                      backend = "cmdstanr")
+broom.mixed::tidy(mod_atrazine_3)
+
+plot(mod_atrazine_3)
+```
+

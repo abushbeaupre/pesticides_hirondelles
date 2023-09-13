@@ -1,0 +1,1239 @@
+---
+title: "Analyses pesticides pour Valérie Lemieux"
+author: "Par Marc Bélisle, Département de biologie, Université de Sherbrooke"
+date: "16/1/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+####Working directory
+```{r, error=TRUE, eval=F}
+setwd("~/Documents/Etudiants/Valérie_Lemieux/RDA")
+```
+
+####Packages
+```{r, error=TRUE}
+library(readxl)
+library(openxlsx)
+library(reshape2)
+library(plyr)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(NADA)
+library(vegan)
+library(nlme)
+library(lme4)
+library(GLMMadaptive)
+library(glmmTMB)
+library(bbmle)
+library(sjstats)
+library(DHARMa)
+library(mgcv)
+library(car)
+library(AICcmodavg)
+library(visreg)
+library(ggplot2)
+library(GGally)
+library(robCompositions)
+library(factoextra)
+library(ggeffects)
+library(ggpubr)
+
+```
+
+
+##Production des data frames
+
+
+###Provenance des boulettes
+```{r, error=TRUE}
+boulettes <- read.table("~/Documents/Etudiants/Valérie_Lemieux/RDA/BDboulette.txt", header=T)
+boulettes$ferme <- str_pad(boulettes$ferme, 2, pad = "0")
+boulettes <- na.omit(boulettes) # Removes the sample for which the farm ID is unknown.
+b13<-subset(boulettes, year==2013)
+b14<-subset(boulettes, year==2014)
+b15<-subset(boulettes, year==2015)
+b16<-subset(boulettes, year==2016)
+```
+
+
+###Récupération des données via les feuilles MS Excel fournies par les chimistes
+Codes par François Rousseu.
+Le fichier de données MS Excel utilisé ci-dessous est une version où les ID ont été validés et où les ID composés de 2013 ont été corrigés suivant les corrections faites dans le fichier "Résultats finaux pesticides boli 2013-2016 cleaned" (voir commentaires de cellules et ID -> ID2), où l'échantillon "X" de 2013 a été retiré du fait qu'on ne connaissait pas la ferme où l'échantillon a été récolté, et où les données de bourdons (62 dernières lignes de 2016 avec ID composés) ont été retirées.
+
+```{r, error=TRUE}
+path<-"~/Documents/Etudiants/Valérie_Lemieux/RDA/Hirondelle_results-Finale_oct 2018-révisée-cleaned_on_1janv2019.xlsx"
+
+format_pesticides<-function(path){
+ 
+  sheets<-excel_sheets(path)
+ 
+  l<-lapply(sheets,function(i){
+    x<-read.xlsx(path,sheet=i)
+    s<-grep("sample",x[,1],ignore.case=TRUE) # assumes that the data starts at "sample"
+    d<-x[(s+1):nrow(x),]
+    names(d)<-unname(as.vector(x[s,]))
+    lo<-unname(x[(s-2):s,]) # assumes that in the lines before "sample", there is "LOD" and "LOQ"
+    first_pest<-suppressWarnings(which(!is.na(as.numeric(as.vector(lo[1,]))))[1]) # this spots the first pesticide by searching the first value that can be converted to numeric in the LOD line
+    limits<-as.data.frame(t(lo[,first_pest:ncol(lo)]),stringsAsFactors=FALSE)
+    names(limits)<-c("LOD","LOQ","pesticide")
+    limits[1:2]<-lapply(limits[1:2],as.numeric)
+    pesticides<-names(d)[first_pest:ncol(d)]
+    d[pesticides]<-lapply(pesticides,function(j){
+      m<-match(j,limits$pesticide)
+      lod<-limits[m,c("LOD")]
+      loq<-limits[m,c("LOQ")]
+      val<-d[,j]
+      valn<-suppressWarnings(format(round(as.numeric(val),3),nsmall=3,trim=TRUE)) # all values seem to have three digits
+      ifelse(is.na(val),val, # an NA value stays NA
+             ifelse(val%in%c("nd","ND"),paste0("0-",lod), # a nd value is converted to "0-LOD"
+                    ifelse(val=="<LOQ",paste0(lod,"-",loq),valn # a <LOQ is converted to "LOD_LOQ" and a value stays the same value
+                    )
+             )
+      )
+    })
+    d<-cbind(year=i,d,stringsAsFactors=FALSE)
+    d
+  })
+ 
+  d<-Reduce(function(...){merge(...,all=TRUE)},l) # merge is used cause new pesticides could be added from year to year
+  d[,"masse.mg"]<-as.numeric(d[,"masse.mg"])
+  #d[,"sample"]<-as.integer(d[,"sample"]) # some samples may have combined labels if not corrected in the input file
+  d<-with(d,d[order(year,sample),])
+  d
+ 
+}
+ 
+ 
+p<-format_pesticides(path)
+p<-merge(boulettes, p)
+p<-with(p,p[order(year,sample),])
+p2 <- melt(p, id.vars = c("sample", "year", "JJ", "ferme", "masse.mg"), variable.name="pesticide", value.name="conc") #transformer le jeu de données de manière à avoir une variable pesticide plutôt que chaque pesticide soit une colonne.
+p13<-subset(p, year==2013)
+p14<-subset(p, year==2014)
+p15<-subset(p, year==2015)
+p16<-subset(p, year==2016)
+
+```
+
+
+
+###Composition des paysages
+On définie la composition au sein d'un rayon de 500 m autour du nichoir où la boulette a été récupérée.
+
+```{r, error=TRUE}
+env500m.db <- read_excel("~/Documents/Etudiants/Valérie_Lemieux/RDA/Caracterisation_50-500m_2006-2017.xlsx", sheet="detail", na="NA")
+
+#Définition des classes de composition
+arbres <- c("arbre", "arbreforet", "fricheforestiere", "arbreilot", "pepiniere")
+mais <- c("canolamais",	"mais",	"maisbio", "maisble",	"maisfourrage","maisfriche", "maissoya","soyamais")
+ble <- c("ble",	"bleavoine",	"blebio",	"bleseiglebio","blesoya",	"bleorge",	"bleseigle","blecanola","avoineble")
+maraicher <-c("maraicher", "maraicherbio", "verger", "pois", "poisbio")
+soya <- c("Canolasoya",	"CanolaSoyaBio", "milletsoya", "soya", "soyaavoine", "soyacanola", "soyabio",	"soyaMRF", "soyable")
+autres.cereales <- c("autrecereal", "avoine", "avoinecanola", "orge", "orgeavoine", "orgesoya", "orgebio", "orgeseigle", "sarrazin", "seigle",	"seigleavoine", "lin", "tournesol", "CanolaTournesol", "canola")
+fourrages <- c("blefourrage", "fricheble", "soyafourrage", "canolapois", "CanolaPoisOrge", "CanolaPoisSarrasin", "canolaluzerne", "avoinefriche", "fourrageble", "soyafriche", "fourrage", "friche", "avbleinconnu", "poisavoine", "luzerne", "inconnu", "bleorgepoisbio", "bleavpoisext", "orgepoidavbio")
+paturages <- c("paturage", "frichepaturage")
+terre <- c("terre")
+urbain <- c("beton", "urbainarbre",	"urbainbeton",	"urbainfriche",	"urbain")
+
+## Préparation des données ---------------------------------------------------------------
+  # Dataframe des categories enviro
+  carac.tot <- data.frame(env500m.db[,c("annee", "idnich", "ferme", "nichoir", "rayon")],
+                          corn=rowSums(env500m.db[,mais])/100,
+                          soy=rowSums(env500m.db[,soya])/100,
+                          wheat=rowSums(env500m.db[,ble])/100,
+                          other.cereals=rowSums(env500m.db[,autres.cereales])/100,
+                          vegetables=rowSums(env500m.db[,maraicher])/100,
+                          fodders=rowSums(env500m.db[,fourrages])/100,
+                          pastures=rowSums(env500m.db[,paturages])/100)
+
+carac.tot$idnich  <- as.factor(carac.tot$idnich)
+carac.tot$ferme   <- as.factor(carac.tot$ferme)
+carac.tot$nichoir <- as.factor(carac.tot$nichoir)
+
+carac.tot$a <- paste(carac.tot$annee,carac.tot$ferme,sep="_")
+carac.500 <- subset(carac.tot,rayon==500)
+tp <- data.frame(subset(carac.tot, select=-c(1:5))%>%
+                group_by(a)%>%
+                dplyr::summarise_all(funs(mean))) #moyenne par nichoir
+
+land <- separate(tp,a, c("annee","ferme"),sep = "_")
+names(land)[names(land) == "annee"] <- "year"
+land$Shannon <- diversity(land[,3:9], index = "shannon", MARGIN = 1, base = exp(1))
+land1316 <- subset(land, year>2012 & year<2017)
+land13 <- subset(land, year==2013)
+land14 <- subset(land, year==2014)
+land15 <- subset(land, year==2015)
+land16 <- subset(land, year==2016)
+
+cor(land1316[,3:10])
+tapply(land1316$corn, land1316$year, summary, na.rm=T)
+tapply(land1316$soy, land1316$year, summary, na.rm=T)
+tapply(land1316$wheat, land1316$year, summary, na.rm=T)
+tapply(land1316$other.cereals, land1316$year, summary, na.rm=T)
+tapply(land1316$fodders, land1316$year, summary, na.rm=T)
+
+##Préparation des données avec toutes les classes pour ordination avec pcaCoDa---------------------------------------------
+
+  carac.tot2 <- data.frame(env500m.db[,c("annee", "idnich", "ferme", "nichoir", "rayon")],
+                          corn=rowSums(env500m.db[,mais])/100,
+                          soy=rowSums(env500m.db[,soya])/100,
+                          wheat=rowSums(env500m.db[,ble])/100,
+                          other.cereals=rowSums(env500m.db[,autres.cereales])/100,
+                          vegetables=rowSums(env500m.db[,maraicher])/100,
+                          fodders=rowSums(env500m.db[,fourrages])/100,
+                          pastures=rowSums(env500m.db[,paturages])/100,
+                          forest=rowSums(env500m.db[,arbres])/100,
+                          fallow=rowSums(env500m.db[,terre])/100,
+                          urban=rowSums(env500m.db[,urbain])/100)
+
+carac.tot2$idnich  <- as.factor(carac.tot$idnich)
+carac.tot2$ferme   <- as.factor(carac.tot$ferme)
+carac.tot2$nichoir <- as.factor(carac.tot$nichoir)
+
+carac.tot2$a <- paste(carac.tot2$annee,carac.tot2$ferme,sep="_")
+carac.500.2 <- subset(carac.tot2,rayon==500)
+tp2 <- data.frame(subset(carac.tot2, select=-c(1:5))%>%
+                group_by(a)%>%
+                dplyr::summarise_all(funs(mean))) #moyenne par nichoir
+
+land2 <- separate(tp2,a, c("annee","ferme"),sep = "_")
+names(land2)[names(land2) == "annee"] <- "year"
+land1316.2 <- subset(land2, year>2012 & year<2017)
+
+```
+
+
+###Transformation des dosages en 0/1 [non-détecté(<LOD)/détecté]
+
+```{r, error=TRUE}
+path<-"~/Documents/Etudiants/Valérie_Lemieux/RDA/Hirondelle_results-Finale_oct 2018-révisée-cleaned_on_1janv2019.xlsx"
+
+format_pesticides<-function(path){
+ 
+  sheets<-excel_sheets(path)
+ 
+  l<-lapply(sheets,function(i){
+    x<-read.xlsx(path,sheet=i)
+    s<-grep("sample",x[,1],ignore.case=TRUE) # assumes that the data starts at "sample"
+    d<-x[(s+1):nrow(x),]
+    names(d)<-unname(as.vector(x[s,]))
+    lo<-unname(x[(s-2):s,]) # assumes that in the lines before "sample", there is "LOD" and "LOQ"
+    first_pest<-suppressWarnings(which(!is.na(as.numeric(as.vector(lo[1,]))))[1]) # this spots the first pesticide by searching the first value that can be converted to numeric in the LOD line
+    limits<-as.data.frame(t(lo[,first_pest:ncol(lo)]),stringsAsFactors=FALSE)
+    names(limits)<-c("LOD","LOQ","pesticide")
+    limits[1:2]<-lapply(limits[1:2],as.numeric)
+    pesticides<-names(d)[first_pest:ncol(d)]
+    d[pesticides]<-lapply(pesticides,function(j){
+      m<-match(j,limits$pesticide)
+      lod<-limits[m,c("LOD")]
+      loq<-limits[m,c("LOQ")]
+      val<-d[,j]
+      valn<-suppressWarnings(format(round(as.numeric(val),3),nsmall=3,trim=TRUE)) # all values seem to have three digits
+      ifelse(is.na(val),val, # an NA value stays NA
+             ifelse(val%in%c("nd","ND"),paste0(0), # a nd value is converted to 0
+                    ifelse(val=="<LOQ",paste0(1),1 # a <LOQ is converted to 1
+                    )
+             )
+      )
+    })
+    d[3:ncol(d)]<-lapply(d[3:ncol(d)], as.integer)
+    d<-cbind(year=i,d,stringsAsFactors=FALSE)
+    d
+  })
+ 
+  d<-Reduce(function(...){merge(...,all=TRUE)},l) # merge is used cause new pesticides could be added from year to year
+  d[,"masse.mg"]<-as.numeric(d[,"masse.mg"])
+  #d[,"sample"]<-as.integer(d[,"sample"]) # some samples may have combined labels if not corrected in the input file
+  d<-with(d,d[order(year,sample),])
+  d
+ 
+}
+ 
+ 
+detect<-format_pesticides(path)
+detect<-merge(boulettes, detect)
+detect<-with(detect,detect[order(year,sample),])
+detect2 <- melt(detect, id.vars = c("sample", "year", "JJ", "ferme", "masse.mg"), variable.name="pesticide", value.name="detected")
+detect13<-subset(detect, year==2013)
+detect14<-subset(detect, year==2014)
+detect15<-subset(detect, year==2015)
+detect16<-subset(detect, year==2016)
+
+```
+
+
+
+###Transformation des dosages en 0/1 [non-quantifié(<LOQ)/quantifié]
+
+```{r, error=TRUE}
+path<-"~/Documents/Etudiants/Valérie_Lemieux/RDA/Hirondelle_results-Finale_oct 2018-révisée-cleaned_on_1janv2019.xlsx"
+
+format_pesticides<-function(path){
+ 
+  sheets<-excel_sheets(path)
+ 
+  l<-lapply(sheets,function(i){
+    x<-read.xlsx(path,sheet=i)
+    s<-grep("sample",x[,1],ignore.case=TRUE) # assumes that the data starts at "sample"
+    d<-x[(s+1):nrow(x),]
+    names(d)<-unname(as.vector(x[s,]))
+    lo<-unname(x[(s-2):s,]) # assumes that in the lines before "sample", there is "LOD" and "LOQ"
+    first_pest<-suppressWarnings(which(!is.na(as.numeric(as.vector(lo[1,]))))[1]) # this spots the first pesticide by searching the first value that can be converted to numeric in the LOD line
+    limits<-as.data.frame(t(lo[,first_pest:ncol(lo)]),stringsAsFactors=FALSE)
+    names(limits)<-c("LOD","LOQ","pesticide")
+    limits[1:2]<-lapply(limits[1:2],as.numeric)
+    pesticides<-names(d)[first_pest:ncol(d)]
+    d[pesticides]<-lapply(pesticides,function(j){
+      m<-match(j,limits$pesticide)
+      lod<-limits[m,c("LOD")]
+      loq<-limits[m,c("LOQ")]
+      val<-d[,j]
+      valn<-suppressWarnings(format(round(as.numeric(val),3),nsmall=3,trim=TRUE)) # all values seem to have three digits
+      ifelse(is.na(val),val, # an NA value stays NA
+             ifelse(val%in%c("nd","ND"),paste0(0), # a nd value is converted to 0
+                    ifelse(val=="<LOQ",paste0(0),1 # a <LOQ is converted to 0
+                    )
+             )
+      )
+    })
+    d[3:ncol(d)]<-lapply(d[3:ncol(d)], as.integer)
+    d<-cbind(year=i,d,stringsAsFactors=FALSE)
+    d
+  })
+ 
+  d<-Reduce(function(...){merge(...,all=TRUE)},l) # merge is used cause new pesticides could be added from year to year
+  d[,"masse.mg"]<-as.numeric(d[,"masse.mg"])
+  #d[,"sample"]<-as.integer(d[,"sample"]) # some samples may have combined labels if not corrected in the input file
+  d<-with(d,d[order(year,sample),])
+  d
+ 
+}
+ 
+ 
+quant<-format_pesticides(path)
+quant<-merge(boulettes, quant)
+quant<-with(quant,quant[order(year,sample),])
+quant2 <- melt(quant, id.vars = c("sample", "year", "JJ", "ferme", "masse.mg"), variable.name="pesticide", value.name="quantified")
+quant13<-subset(quant, year==2013)
+quant14<-subset(quant, year==2014)
+quant15<-subset(quant, year==2015)
+quant16<-subset(quant, year==2016)
+
+```
+
+
+###Transformation des dosages pour modèles zero-inflated
+```{r, error=TRUE}
+path<-"~/Documents/Etudiants/Valérie_Lemieux/RDA/Hirondelle_results-Finale_oct 2018-révisée-cleaned_on_1janv2019.xlsx"
+
+format_pesticides<-function(path){
+ 
+  sheets<-excel_sheets(path)
+ 
+  l<-lapply(sheets,function(i){
+    x<-read.xlsx(path,sheet=i)
+    s<-grep("sample",x[,1],ignore.case=TRUE) # assumes that the data starts at "sample"
+    d<-x[(s+1):nrow(x),]
+    names(d)<-unname(as.vector(x[s,]))
+    lo<-unname(x[(s-2):s,]) # assumes that in the lines before "sample", there is "LOD" and "LOQ"
+    first_pest<-suppressWarnings(which(!is.na(as.numeric(as.vector(lo[1,]))))[1]) # this spots the first pesticide by searching the first value that can be converted to numeric in the LOD line
+    limits<-as.data.frame(t(lo[,first_pest:ncol(lo)]),stringsAsFactors=FALSE)
+    names(limits)<-c("LOD","LOQ","pesticide")
+    limits[1:2]<-lapply(limits[1:2],as.numeric)
+    pesticides<-names(d)[first_pest:ncol(d)]
+    d[pesticides]<-lapply(pesticides,function(j){
+      m<-match(j,limits$pesticide)
+      lod<-limits[m,c("LOD")]
+      loq<-limits[m,c("LOQ")]
+      val<-d[,j]
+      valn<-suppressWarnings(format(round(as.numeric(val),3),nsmall=3,trim=TRUE)) # all values seem to have three digits
+      ifelse(is.na(val),val, # an NA value stays NA
+             ifelse(val%in%c("nd","ND"),paste0(0), # a nd value is converted to 0
+                    ifelse(val=="<LOQ",paste0(0),valn # a <LOQ is converted to 0 and a >=LOQ stays the same value
+                    )
+             )
+      )
+    })
+    d[3:ncol(d)]<-lapply(d[3:ncol(d)], as.numeric)
+    d<-cbind(year=i,d,stringsAsFactors=FALSE)
+    d
+  })
+ 
+  d<-Reduce(function(...){merge(...,all=TRUE)},l) # merge is used cause new pesticides could be added from year to year
+  d[,"masse.mg"]<-as.numeric(d[,"masse.mg"])
+  #d[,"sample"]<-as.integer(d[,"sample"]) # some samples may have combined labels if not corrected in the input file
+  d<-with(d,d[order(year,sample),])
+  d
+ 
+}
+ 
+ 
+zi<-format_pesticides(path)
+zi<-merge(boulettes, zi)
+zi<-with(zi,zi[order(year,sample),])
+zi2 <- melt(zi, id.vars = c("sample", "year", "JJ", "ferme", "masse.mg"), variable.name="pesticide", value.name="conc.zi")
+zi13<-subset(zi, year==2013)
+zi14<-subset(zi, year==2014)
+zi15<-subset(zi, year==2015)
+zi16<-subset(zi, year==2016)
+
+```
+
+
+###Transformation des dosages en u-scores
+Codes par François Rousseu.
+
+####Codes de la fonction uscore
+```{r, error=TRUE, eval=F}
+uscore<-function(x,rank=FALSE,debug=FALSE){
+  if(is.factor(x) || is.numeric(x)){
+    x<-as.character(x) 
+  }
+  l<-strsplit(x,"-")
+  l<-lapply(l,as.numeric)
+  lnoNAs<-l[!is.na(x)]
+  val2<-sapply(lnoNAs,function(xx){xx[length(xx)]})
+  val1<-sapply(lnoNAs,"[",1)
+  res<-sapply(seq_along(l),function(i){
+    v<-l[[i]]
+    if(any(is.na(v))){
+      NA  # on retourne NA si la valeur à la base est NA
+    }else{
+      hi<-v[1]>=val2
+      lo<-v[length(v)]<=val1
+      val<-ifelse((hi & lo) | (!hi & !lo),0,ifelse(hi,1,-1))
+      if(debug){ # the debug option prints the value for each comparison that is not with NAs
+        temp<-val
+        cat(paste(v,collapse="-"))
+        names(temp)<-sapply(lnoNAs,paste,collapse="-")
+        cat("\n")
+        print(temp)
+        cat("\n\n")
+      }
+      sum(val)
+    }
+  })
+  if(rank){
+    rank(res)
+  }else{
+    res 
+  } 
+}
+
+```
+
+
+####Application de la fonction uscore
+```{r, error=TRUE, eval=F}
+
+u <- lapply(p[6:ncol(p)],uscore)
+ranku <- lapply(u,rank)
+
+u1316 <- cbind(p[,1:5], ranku)
+u13 <- subset(u1316, year==2013)
+u14 <- subset(u1316, year==2014)
+u15 <- subset(u1316, year==2015)
+u16 <- subset(u1316, year==2016)
+```
+
+
+##Statistiques descriptives de base
+
+###Tableau synthèse
+
+####Number of samples analyzed for a given pesticide
+```{r, error=TRUE}
+sample.size <- function(i) {sum(!is.na(i))}
+num.samples <- tapply(detect2$detected, list(detect2$pesticide), sample.size)
+```
+
+
+####Ppt of samples in which a given pesticide was detected (per thousand)
+```{r, error=TRUE}
+ppt.detected <- round(1000*tapply(detect2$detected, list(detect2$pesticide), mean, na.rm=T), digits=2)
+```
+
+
+####Ppt of samples in which a given pesticide was quantified (per thousand)
+```{r, error=TRUE}
+ppt.quantified <- round(1000*tapply(quant2$quantified, list(quant2$pesticide), mean, na.rm=T), digits=2)
+```
+
+
+####Mean, SD, min and max concentration (ng/g) for samples in which a given pesticide was quantified
+```{r, error=TRUE}
+zi2.quant <- subset(zi2, conc.zi>0)
+mean.quantified <- round(tapply(zi2.quant$conc.zi, list(zi2.quant$pesticide), mean, na.rm=T), digits=2)
+sd.quantified <- round(tapply(zi2.quant$conc.zi, list(zi2.quant$pesticide), sd, na.rm=T), digits=2)
+min.quantified <- round(tapply(zi2.quant$conc.zi, list(zi2.quant$pesticide), min, na.rm=T), digits=2)
+max.quantified <- round(tapply(zi2.quant$conc.zi, list(zi2.quant$pesticide), max, na.rm=T), digits=2)
+```
+
+
+####Tableau
+```{r, error=TRUE}
+table <- data.frame(num.samples, ppt.detected, ppt.quantified, mean.quantified, sd.quantified, min.quantified, max.quantified)
+table
+
+table2 <- table[order(ppt.detected),]
+write.csv(table, "synthesis-pest-table.csv")
+```
+
+
+####Fréquences relatives de x < LOD, LOD <= x < LOQ et LOQ <= x pour l'ensemble des boulettes et des pesticides
+```{r, error=TRUE}
+length(detect$sample) #Nombre de boulettes analysées.
+tot.entries <- length(detect$sample)*54
+tot.na <- sum(apply(apply(detect[,6:ncol(detect)], 2, is.na), 2, sum)) #Nombre de NA dans la base.
+
+freq.detect.tot <- sum(apply(detect[,6:ncol(detect)], 2, sum, na.rm=T))
+freq.loq <- sum(apply(quant[,6:ncol(quant)], 2, sum, na.rm=T))
+freq.lod.loq <- freq.detect.tot-freq.loq
+freq.lod <- tot.entries-tot.na-freq.detect.tot
+
+1000*freq.lod/(tot.entries-tot.na)
+1000*freq.lod.loq/(tot.entries-tot.na)
+1000*freq.loq/(tot.entries-tot.na)
+
+# 3D Exploded Pie Chart
+library(plotrix)
+slices <- c(freq.lod, freq.lod.loq, freq.loq)
+lbls <- c("x < LOD", "LOD <= x < LOQ", "LOQ <= x")
+pie(slices,labels=lbls, col=c("grey", "blue", "red"))
+```
+
+
+####Distribution de fréquence du nombre de pesticides détectés par boulette
+On suppose ici que 1545 échantillons ont été analysés pour tous les pesticides; les fréquences relatives sont donc un tantinet conservatrices.
+```{r, error=TRUE}
+freq.detect <- rowSums(detect[,6:ncol(detect)], na.rm=T)
+freq.detect13 <- rowSums(detect13[,6:ncol(detect13)], na.rm=T)
+freq.detect14 <- rowSums(detect14[,6:ncol(detect14)], na.rm=T)
+freq.detect15 <- rowSums(detect15[,6:ncol(detect15)], na.rm=T)
+freq.detect16 <- rowSums(detect16[,6:ncol(detect16)], na.rm=T)
+
+table(freq.detect)
+table(freq.detect[freq.detect>0])
+
+1000*table(freq.detect)/nrow(detect) #Fréquences relatives pour 2013-2016.
+1000*table(freq.detect[freq.detect>0])/nrow(detect) #Fréquences relatives pour 2013-2016.
+
+1000*table(freq.detect13[freq.detect13>0])/nrow(detect13) #Fréquences relatives pour 2013.
+1000*table(freq.detect14[freq.detect14>0])/nrow(detect14)
+1000*table(freq.detect15[freq.detect15>0])/nrow(detect15)
+1000*table(freq.detect16[freq.detect16>0])/nrow(detect16)
+
+x <- c(1:7,16)
+#y <- c(358,159,96,32,13,4,1,1)
+library(plotrix)
+gap.plot(x, 1000*table(freq.detect[freq.detect>0])/1545, gap=c(8,15), gap.axis="x", bgcol="white", type="h", lwd=5, ylim=c(0,250), xtics=c(1:7,16), xticlab=c(1:7,16), ytics=seq(0,250,50), xlab="Number of pesticides detected", ylab="Relative frequency (/1000 samples)", cex.lab=1.5)
+abline(v=seq(7.99,8.19,.001), col="white")
+axis.break(axis=1, breakpos=8, style="slash")
+axis.break(axis=3, breakpos=8, style="slash")
+
+```
+
+
+####Nombre de pesticides détectés par boulette en fonction de la diversité en culture (Shannon avec base en log népérien)
+#####Approche graphique
+On suppose ici que tous les pesticides ont été analysés pour l'ensemble des échantillons.
+```{r, error=TRUE}
+freq.detect <- rowSums(detect[,6:ncol(detect)], na.rm=T)
+freq.detect13 <- rowSums(detect13[,6:ncol(detect13)], na.rm=T)
+freq.detect14 <- rowSums(detect14[,6:ncol(detect14)], na.rm=T)
+freq.detect15 <- rowSums(detect15[,6:ncol(detect15)], na.rm=T)
+freq.detect16 <- rowSums(detect16[,6:ncol(detect16)], na.rm=T)
+
+detect$freq.detect <- freq.detect
+detect.land <- merge(detect, land1316)
+detect.land$year <- as.factor(detect.land$year)
+detect.land$ferme <- as.factor(detect.land$ferme)
+detect.land.red <- subset(detect.land, freq.detect<16)
+head(detect.land)
+
+detect.land.red$freq.detect.fact <- as.factor(detect.land.red$freq.detect)
+
+ggplot(detect.land.red, aes(Shannon, corn, colour=freq.detect.fact, size=freq.detect)) + geom_point() + geom_jitter(width=0.8) + scale_size(range=c(0,6)) + scale_color_brewer("Number")
+
+ggplot(detect.land.red, aes(Shannon, corn, colour=freq.detect.fact, size=freq.detect)) + geom_point() + geom_jitter(width=0.8) + scale_size(range=c(0,6)) + scale_color_manual(values=c('#ffffb2','#fed976','#feb24c','#fd8d3c','#fc4e2a','#e31a1c','#b10026'))
+
+ggplot(detect.land.red, aes(Shannon, soy, colour=freq.detect.fact, size=freq.detect)) + geom_point() + geom_jitter(width=0.8) + scale_size(range=c(0,6)) + scale_color_manual(values=c('#ffffb2','#fed976','#feb24c','#fd8d3c','#fc4e2a','#e31a1c','#b10026'))
+
+#RColorBrewer::display.brewer.all()
+ggplot(detect.land.red, aes(Shannon, freq.detect, colour=corn)) + geom_point() + geom_jitter(width=0.5)
+```
+
+
+#####Modélisation
+Du fait de la présence de surdispersion, pas très importante par ailleurs, nous avons considéré des modèles zero-inflated afin de prendre en compte, du moins en partie, les problèmes de détection imparfaite. Le fait que des formulations contenant un certain "mix" de pesticides soient utilisées, il y a probablement une surdispersion additionnelle au sein des non-zero counts vs ce qui serait attendu via une loi de Poisson. Par conséquent, il était intéressant d'envisager une distribution binomiale négative; malheureusement (?) ça ne convergeait pas.
+```{r, error=TRUE}
+cor(detect.land.red$Shannon, detect.land.red$corn)
+
+richness <- glmer(freq.detect ~ year + Shannon + corn + (1|ferme), data=detect.land.red, family=poisson(link="log"))
+overdisp(richness) #c-hat de 1.12...
+
+richness.p0 <- glmmTMB(freq.detect ~ year + Shannon + corn + (1|ferme), data=detect.land.red, ziformula=~0, family=poisson(link="log")) #Même modèle que richness.
+
+richness.p1 <- glmmTMB(freq.detect ~ year + (1|ferme), data=detect.land.red, ziformula=~ (1|ferme), family=poisson(link="log"))
+
+richness.p2 <- glmmTMB(freq.detect ~ year + Shannon + corn + (1|ferme), data=detect.land.red, ziformula=~ year + Shannon + corn + (1|ferme), family=poisson(link="log"))
+
+richness.nb <- glmmTMB(freq.detect ~ year + Shannon + corn + (1|ferme), data=detect.land.red, ziformula=~ year + Shannon + corn + (1|ferme), family=nbinom2)
+
+summary(richness)
+summary(richness.p0)
+summary(richness.p1)
+summary(richness.p2)
+summary(richness.nb)
+AICtab(richness.p0, richness.p1, richness.p2, richness.nb) #richness.p1 est nettement meilleur que richness.p0.
+
+visreg(richness.nb, "corn", scale="response")
+visreg2d(richness.p2, "Shannon", "corn", scale="response", plot.type="image")
+visreg2d(richness.nb, "Shannon", "corn", scale="response", plot.type="image")
+
+```
+
+
+####Influence de la composition du paysage agricole sur la contamination: une approche par ordination
+
+#####Détections vs non-détections
+D'abord un essai avec 2013, l'année où les détections étaient relativement moins fréquentes. On note que la RDA ne performe pas vraiment bien; R^2 = 0.02. Restreindre au pesticides dont la fréquence relative de détection est d'au moins 10/1000 n'améliore pas vraiment les choses; R^2 = 0.03.
+```{r, error=TRUE}
+detect13.2 <- melt(detect13, id.vars = c("sample", "year", "JJ", "ferme", "masse.mg"), variable.name="pesticide", value.name="detected")
+tapply(detect13.2$detected, list(detect13.2$pesticide), mean, na.rm=T) #Identification des pesticides jamais détectés.
+
+detect13<-subset(detect, year==2013)
+cond <- function(x) {(1000*sum(x, na.rm=T)/length(x))>1} #Pour garder les pesticides dont la fréquence relative de détection est d'au moins 1/1000.
+
+detect13 <- data.frame(detect13[,1:5], select_if(detect13[,6:ncol(detect13)], cond))
+detect.land13 <- na.omit(merge(detect13, land13))
+
+sp13 <-detect.land13[,6:ncol(detect13)]
+env13 <- detect.land13[,(ncol(detect13)+1):(ncol(detect13)+7)]
+
+rda13 <- rda(sp13, env13, scale=T)
+summary(rda13)
+```
+
+
+On fait fi des années, question d'avoir plus de détections. Ça n'améliore pas grand chose... R^2 = 0.02. On va donc se pencher sur l'utilisation des u-scores...
+```{r, error=TRUE}
+tapply(detect2$detected, list(detect2$pesticide), mean, na.rm=T) #Identification des pesticides jamais détectés.
+
+cond <- function(x) {(1000*sum(x, na.rm=T)/length(x))>=10} #Pour garder les pesticides dont la fréquence relative de détection est d'au moins 10/1000.
+
+detect.cond <- data.frame(detect[,1:5], select_if(detect[,6:ncol(detect)], cond))
+detect.land <- na.omit(merge(detect.cond, land))
+
+sp <-detect.land[,6:ncol(detect.cond)]
+env <- detect.land[,(ncol(detect.cond)+1):(ncol(detect.cond)+7)]
+
+rda.all <- rda(sp, env, scale=T)
+summary(rda.all)
+plot(rda.all, scaling=2)
+```
+
+
+#####u-scores
+Ouein... Une PCA sur des u-scores n'améliore pas les choses...
+```{r, error=TRUE}
+u1316.2 <- melt(u1316, id.vars = c("sample", "year", "JJ", "ferme", "masse.mg"), variable.name="pesticide", value.name="rank")
+tapply(u1316.2$rank, list(u1316.2$pesticide), sd, na.rm=T) #Identification des pesticides jamais détectés (i.e., sd=0).
+
+cond <- function(x) {sd(x)>0} #Pour garder les pesticides qui ont été détectés au moins une fois.
+
+u1316.cond <- data.frame(u1316[,1:5], select_if(u1316[,6:ncol(u1316)], cond))
+u1316.land <- na.omit(merge(u1316.cond, land1316))
+
+sp <- u1316.land[,6:ncol(u1316.cond)]
+env <- u1316.land[,(ncol(u1316.cond)+1):(ncol(u1316.cond)+7)]
+
+rda.all <- rda(sp, env, scale=T)
+summary(rda.all)
+plot(rda.all, scaling=2)
+```
+
+
+#####Ordination de la composition des paysages agricoles et indicateur de contamination des sites: une approche graphique
+Comme rien n'est facile... nous faisons ici affaire à des données compositionnelles qui sont implicitement contraintes par le fait que la somme des proportions est de 1. Nous ne pouvons par conséquent traiter ces données comme si elles n'étaient pas sujettes à cette contrainte. Nous optons donc ici pour une PCA robuste impliquant une transformation ilr, et ce, tel que suggéré par Filzmoser, P., K. Hron, and C. Reimann. 2009. Principal component analysis for compositional data with outliers. Environmetrics 20:621-632. L'aspect robuste de la PCA sera ici utile du fait que nous avons des cultures dont les distributions de fréquences sont assez skewed vers la droite. Ceci étant dit, nous sommes aussi conscients que l'aspect multinormal n'est probablement pas parfait.
+
+Du point de vue pratique, nous utilisons la fonction `pcaCoDA` du package `robCompositions`: voir https://www.rdocumentation.org/packages/robCompositions/versions/2.0.10
+https://www.rdocumentation.org/packages/robCompositions/versions/2.0.10/topics/pcaCoDa
+
+
+EN CONSTRUCTION
+```{r, error=TRUE}
+
+pca.land.cov.noncomp <- rda(land1316.2[3:12], scale=F)
+summary(pca.land.cov.noncomp)
+
+land1316.2[3:12] <- land1316.2[3:12]*100
+
+pca.land.cov <- pcaCoDa(land1316.2[3:12], method = "robust", mult_comp = NULL, external = NULL) #Ne passe pas pcq n trop faible.
+
+#The real stuff starts here...
+land1316$cereals <- land1316$wheat+land1316$other.cereals
+land1316.red <- land1316[c(1:4,8,9,11)]
+
+pca.land.cov <- pcaCoDa(land1316.red[3:7]*100+1, method = "robust", mult_comp = NULL, external = NULL)
+pca.land.cov
+summary(pca.land.cov)
+biplot(pca.land.cov)
+land1316.red <- data.frame(land1316.red, pca.land.cov$scores)
+
+#Représentation graphique à travailler. Check ggfortify et ggbiplot
+plot(pca.land.cov, scaling=1, main="PCA 2013-2016 - scaling 1", type="none", xlab=c("PC1"), ylab=c("PC2"))
+points(scores(pca.land.cov, display="sites", choices=c(1,2), scaling=1),
+       pch=21, col="black", bg="steelblue", cex=1)
+arrows(0,0,
+       scores(pca.land.cov, display="species", choices=c(1), scaling=1),
+       scores(pca.land.cov, display="species", choices=c(2), scaling=1),
+       col="black",length=0)
+text(scores(pca.land.cov, display="species", choices=c(1), scaling=1),
+     scores(pca.land.cov, display="species", choices=c(2), scaling=1),
+     labels=rownames(scores(pca.land.cov, display="species", scaling=1)),
+     col="black", cex=0.8) 
+
+plot(pca.land.cov, scaling=2, main="PCA 2013-2016 - scaling 2", type="none", xlab=c("PC1"), ylab=c("PC2"))
+points(scores(pca.land.cov, display="sites", choices=c(1,2), scaling=2),
+       pch=21, col="black", bg="steelblue", cex=1)
+arrows(0,0,
+       scores(pca.land.cov, display="species", choices=c(1), scaling=2),
+       scores(pca.land.cov, display="species", choices=c(2), scaling=2),
+       col="black",length=0)
+text(scores(pca.land.cov, display="species", choices=c(1), scaling=2),
+     scores(pca.land.cov, display="species", choices=c(2), scaling=2),
+     labels=rownames(scores(pca.land.cov, display="species", scaling=2)),
+     col="black", cex=0.8) 
+
+
+plot(pca.land.cor, scaling=1, main="PCA 2013-2016 - scaling 1", type="none", xlab=c("PC1"), ylab=c("PC2"))
+points(scores(pca.land.cor, display="sites", choices=c(1,2), scaling=1),
+       pch=21, col="black", bg="steelblue", cex=1)
+arrows(0,0,
+       scores(pca.land.cor, display="species", choices=c(1), scaling=1),
+       scores(pca.land.cor, display="species", choices=c(2), scaling=1),
+       col="black",length=0)
+text(scores(pca.land.cor, display="species", choices=c(1), scaling=1),
+     scores(pca.land.cor, display="species", choices=c(2), scaling=1),
+     labels=rownames(scores(pca.land.cor, display="species", scaling=1)),
+     col="black", cex=0.8) 
+
+plot(pca.land.cor, scaling=2, main="PCA 2013-2016 - scaling 2", type="none", xlab=c("PC1"), ylab=c("PC2"))
+points(scores(pca.land.cor, display="sites", choices=c(1,2), scaling=2),
+       pch=21, col="black", bg="steelblue", cex=1)
+arrows(0,0,
+       scores(pca.land.cor, display="species", choices=c(1), scaling=2),
+       scores(pca.land.cor, display="species", choices=c(2), scaling=2),
+       col="black",length=0)
+text(scores(pca.land.cor, display="species", choices=c(1), scaling=2),
+     scores(pca.land.cor, display="species", choices=c(2), scaling=2),
+     labels=rownames(scores(pca.land.cor, display="species", scaling=2)),
+     col="black", cex=0.8) 
+
+
+
+
+
+
+
+
+
+
+```
+
+
+
+
+####Influence de la composition du paysage agricole sur la contamination: une approche par régression
+
+#####Détections vs non-détections d'au moins un pesticide au sein d'une boulette
+```{r, error=TRUE}
+freq.detect <- rowSums(detect[,6:ncol(detect)], na.rm=T)
+detect$freq.detect.1 <- freq.detect>0
+detect.land <- merge(detect, land1316)
+detect.land$year <- as.factor(detect.land$year)
+detect.land$ferme <- as.factor(detect.land$ferme)
+row.crops <- detect.land$corn + detect.land$soy + detect.land$wheat + detect.land$other.cereals
+
+detect.1.1 <- glmmTMB(freq.detect.1 ~ corn + soy + wheat + other.cereals + fodders + (1|ferme), data=detect.land, ziformula=~0, family=binomial(link="cloglog"))
+summary(detect.1.1)
+detect.1.2 <- glmmTMB(freq.detect.1 ~ row.crops + fodders + (1|ferme), data=detect.land, ziformula=~0, family=binomial(link="cloglog"))
+summary(detect.1.2)
+AIC(detect.1.1,detect.1.2)
+
+visreg(detect.1.1, "corn", scale="response")
+visreg(detect.1.1, "soy", scale="response")
+visreg(detect.1.1, "wheat", scale="response")
+visreg(detect.1.1, "other.cereals", scale="response")
+visreg(detect.1.1, "fodders", scale="response")
+
+par(mfrow=c(2,2))
+visreg(detect.1.1, "corn", scale="response", ylab="Probability of detecting >=1 pesticide", xlab="Corn")
+visreg(detect.1.1, "soy", scale="response", ylab="Probability of detecting >=1 pesticide", xlab="Soybean")
+visreg(detect.1.1, "wheat", scale="response", ylab="Probability of detecting >=1 pesticide", xlab="Wheat")
+visreg(detect.1.1, "fodders", scale="response", ylab="Probability of detecting >=1 pesticide", xlab="Fodders and pastures")
+```
+
+
+#####Détections vs non-détections pour les pesticides les plus communs
+```{r, error=TRUE}
+tapply(detect2$detected, list(detect2$pesticide), mean, na.rm=T) #Identification des pesticides jamais détectés.
+
+cond <- function(x) {(1000*sum(x, na.rm=T)/length(x))>=10} #Pour garder les pesticides dont la fréquence relative de détection est d'au moins 10/1000.
+
+detect.cond <- data.frame(detect[,1:5], select_if(detect[,6:ncol(detect)], cond))
+detect.land <- merge(detect.cond, land)
+row.crops <- detect.land$corn + detect.land$soy + detect.land$wheat + detect.land$other.cereals
+```
+
+#####Atrazine
+```{r, error=TRUE}
+detect.atrazine1 <- glmmTMB(atrazine ~ corn + soy + wheat + other.cereals + fodders + (1|ferme), data=detect.land, ziformula=~0, family=binomial(link="cloglog"))
+summary(detect.atrazine1)
+detect.atrazine2 <- glmmTMB(atrazine ~ row.crops + fodders + (1|ferme), data=detect.land, ziformula=~0, family=binomial(link="cloglog"))
+summary(detect.atrazine2)
+AIC(detect.atrazine1,detect.atrazine2)
+visreg(detect.atrazine1, "corn", scale="response")
+visreg(detect.atrazine1, "other.cereals", scale="response")
+visreg(detect.atrazine2, "row.crops", scale="response")
+```
+
+#####Metolachlor
+```{r, error=TRUE}
+detect.metolachlor1 <- glmmTMB(metolachlor ~ corn + soy + wheat + other.cereals + fodders + (1|ferme), data=detect.land, ziformula=~0, family=binomial(link="cloglog"))
+summary(detect.metolachlor1)
+detect.metolachlor2 <- glmmTMB(metolachlor ~ row.crops + fodders + (1|ferme), data=detect.land, ziformula=~0, family=binomial(link="cloglog"))
+summary(detect.metolachlor2)
+AIC(detect.metolachlor1,detect.metolachlor2)
+visreg(detect.metolachlor1, "corn", scale="response")
+visreg(detect.metolachlor1, "soy", scale="response")
+visreg(detect.metolachlor1, "other.cereals", scale="response")
+```
+
+#####Imazethapyr
+```{r, error=TRUE}
+detect.imazethapyr1 <- glmmTMB(imazethapyr ~ corn + soy + wheat + other.cereals + fodders + (1|ferme), data=detect.land, ziformula=~0, family=binomial(link="cloglog"))
+summary(detect.imazethapyr1)
+detect.imazethapyr2 <- glmmTMB(imazethapyr ~ row.crops + fodders + (1|ferme), data=detect.land, ziformula=~0, family=binomial(link="cloglog"))
+summary(detect.imazethapyr2)
+AIC(detect.imazethapyr1,detect.imazethapyr2)
+visreg(detect.imazethapyr1, "corn", scale="response")
+visreg(detect.imazethapyr1, "soy", scale="response")
+visreg(detect.imazethapyr1, "wheat", scale="response")
+visreg(detect.imazethapyr1, "other.cereals", scale="response")
+```
+
+#####Clothianidin
+```{r, error=TRUE}
+detect.clothianidin1 <- glmmTMB(clothianidin ~ corn + soy + wheat + other.cereals + fodders + (1|ferme), data=detect.land, ziformula=~0, family=binomial(link="cloglog"))
+summary(detect.clothianidin1)
+detect.clothianidin2 <- glmmTMB(clothianidin ~ row.crops + fodders + (1|ferme), data=detect.land, ziformula=~0, family=binomial(link="cloglog"))
+summary(detect.clothianidin2)
+AIC(detect.clothianidin1,detect.clothianidin2)
+visreg(detect.clothianidin1, "corn", scale="response")
+```
+
+#####Thiacloprid
+```{r, error=TRUE}
+detect.thiacloprid1 <- glmmTMB(thiacloprid ~ corn + soy + wheat + other.cereals + fodders + (1|ferme), data=detect.land, ziformula=~0, family=binomial(link="cloglog"))
+summary(detect.thiacloprid1)
+detect.thiacloprid2 <- glmmTMB(thiacloprid ~ row.crops + fodders + (1|ferme), data=detect.land, ziformula=~0, family=binomial(link="cloglog"))
+summary(detect.thiacloprid2)
+AIC(detect.thiacloprid1,detect.thiacloprid2)
+visreg(detect.thiacloprid1, "wheat", scale="response")
+```
+
+#####Thiamethoxam
+```{r, error=TRUE}
+detect.thiamethoxam1 <- glmmTMB(thiamethoxam ~ corn + soy + wheat + other.cereals + fodders + (1|ferme), data=detect.land, ziformula=~0, family=binomial(link="cloglog"))
+summary(detect.thiamethoxam1)
+detect.thiamethoxam2 <- glmmTMB(thiamethoxam ~ row.crops + fodders + (1|ferme), data=detect.land, ziformula=~0, family=binomial(link="cloglog"))
+summary(detect.thiamethoxam2)
+AIC(detect.thiamethoxam1,detect.thiamethoxam2)
+visreg(detect.thiamethoxam1, "corn", scale="response")
+visreg(detect.thiamethoxam1, "soy", scale="response")
+visreg(detect.thiamethoxam1, "wheat", scale="response")
+```
+
+On pousse ici le bouchon (un euphémisme) avec des pesticides très peu détectés...
+
+#####Thiabendazole
+```{r, error=TRUE}
+detect.thiabendazole <- glmmTMB(thiabendazole ~ corn + soy + wheat + other.cereals + fodders + (1|ferme), data=detect.land, ziformula=~0, family=binomial(link="cloglog"))
+summary(detect.thiabendazole)
+visreg(detect.thiabendazole, "corn", scale="response")
+```
+
+#####Parathion
+```{r, error=TRUE}
+detect.parathion <- glmmTMB(parathion ~ corn + soy + wheat + other.cereals + fodders + (1|ferme), data=detect.land, ziformula=~0, family=binomial(link="cloglog")) #Trop complexe pour converger; probablement du au manque de détections... 
+summary(detect.parathion)
+visreg(detect.parathion, "corn", scale="response")
+```
+
+#####Carbaryl
+```{r, error=TRUE}
+detect.carbaryl <- glmmTMB(carbaryl ~ corn + soy + wheat + other.cereals + fodders + (1|ferme), data=detect.land, ziformula=~0, family=binomial(link="cloglog"))
+summary(detect.carbaryl)
+visreg(detect.carbaryl, "corn", scale="response")
+```
+
+#####Bentazon
+```{r, error=TRUE}
+detect.bentazon <- glmmTMB(bentazon ~ corn + soy + wheat + other.cereals + fodders + (1|ferme), data=detect.land, ziformula=~0, family=binomial(link="cloglog")) #Trop complexe pour converger; probablement du au manque de détections...
+summary(detect.bentazon)
+visreg(detect.bentazon, "corn", scale="response")
+```
+
+#####Piperonyl.butoxide
+```{r, error=TRUE}
+detect.piperonyl.butoxide <- glmmTMB(piperonyl.butoxide ~ corn + soy + wheat + other.cereals + fodders + (1|ferme), data=detect.land, ziformula=~0, family=binomial(link="cloglog")) #Trop complexe pour converger; probablement du au manque de détections...
+summary(detect.piperonyl.butoxide)
+visreg(detect.piperonyl.butoxide, "corn", scale="response")
+```
+
+#####Chlorpyrifos
+```{r, error=TRUE}
+detect.chlorpyrifos <- glmmTMB(chlorpyrifos ~ corn + soy + wheat + other.cereals + fodders + (1|ferme), data=detect.land, ziformula=~0, family=binomial(link="cloglog")) #Trop complexe pour converger; probablement du au manque de détections...
+summary(detect.chlorpyrifos)
+visreg(detect.chlorpyrifos, "corn", scale="response")
+```
+
+
+#####################################################################
+#####################################################################
+
+####Création de la base de données pour influence de la contamination sur insectes
+```{r, error=TRUE}
+
+insect<- read.table("~/Documents/Etudiants/Valérie_Lemieux/insectes_13-16.txt", header=T)
+insect$ferme <- str_pad(insect$ferme, 2, pad = "0")
+
+insect$year<-as.character(insect$year)
+insect$Nombre_inds.<-as.numeric(insect$Nombre_inds.)
+insect$YearFarm<-paste(insect$year,insect$ferme,sep="_")
+
+detect.ferme<-detect%>%
+group_by(year,ferme)%>%summarise(contamination=sum(freq.detect),count=length(freq.detect))
+
+detect.ferme$YearFarm<-paste(detect.ferme$year,detect.ferme$ferme,sep="_")
+
+insect$YearFarmJJ<-paste(insect$year,insect$ferme,insect$jjulien,sep="_")
+
+c<-data.frame(subset(insect, ordre=="DIP")%>%
+  group_by(YearFarmJJ)%>%
+  dplyr:::summarise(num1=mean(Nombre_inds.[piege=="1"]),
+                    num2=mean(Nombre_inds.[piege=="2"]),
+                    bio1=mean(biomasse[piege=="1"]),
+                    bio2=mean(biomasse[piege=="2"])))
+
+
+c<- data.frame(c %>% 
+  rowwise()%>%
+  mutate(Avg.Num=mean(c(num1, num2), na.rm=T),
+         Avg.Bio=mean(c(bio1, bio2), na.rm=T)))
+c<-separate(c,"YearFarmJJ",into = c("year","ferme","jjulien"))
+c$YearFarm<-paste(c$year,c$ferme,sep = "_")
+insectpest<-merge(subset(c,select=c("year","ferme","jjulien","YearFarm","Avg.Num","Avg.Bio")),subset(detect.ferme,select=c("contamination","count",    "YearFarm")),by="YearFarm",all.x=T)
+
+
+pr<- read.table("~/Documents/Etudiants/Valérie_Lemieux/precipitation13-16.txt", header=T)
+pr$ferme <- str_pad(pr$ferme, 2, pad = "0")
+
+pr$YearFarmJJ<-paste(pr$year,pr$ferme,pr$jjulien,sep="_")
+insectpest$YearFarmJJ<-paste(insectpest$year,insectpest$ferme,insectpest$jjulien,sep="_")
+insectpest.env<-merge(subset(insectpest,select=c("year","ferme","jjulien","YearFarm","Avg.Num","Avg.Bio","contamination","count", "YearFarmJJ" )),subset(pr,select=c("precipitations",    "YearFarmJJ")),by="YearFarmJJ",all.x=T)
+head(insectpest.env)
+
+##avec row.crop
+#land1316$row.crop <- land1316$corn + land1316$soy + land1316$wheat + land1316$other.cereals
+#land1316$YearFarm<-paste(land1316$year,land1316$ferme,sep = "_")
+land1316.red$row.crop <- land1316.red$corn + land1316.red$soy + land1316.red$cereals
+
+##avec axes de la PCA
+land1316.red$YearFarm<-paste(land1316.red$year,land1316.red$ferme,sep = "_")
+
+insectpest.land<-merge(subset(insectpest.env,select=c("year","ferme","jjulien","YearFarm","Avg.Num","Avg.Bio","contamination","count", "precipitations" )),subset(land1316.red, select=c("row.crop","Comp.1", "Comp.2",  "YearFarm") ),by = "YearFarm")
+
+head(insectpest.land)
+window.BD <- subset(insectpest.land, jjulien>149 & jjulien<201)
+
+###write.xlsx(window.BD,"C:/Users/valer/OneDrive/Bureau/insectpest.land.PCA.xlsx")
+##Chang? sur excel le nombre/biomasse ?chantillon 2016-40-156; Chang? biomasse n?gative et z?ro pour la limite de la balance##
+
+```
+
+#land1316$YearFarm<-paste(land1316$year,as.integer(land1316$ferme),sep="_")
+#insectpest.land<-merge(insectpest,subset( land1316, select = -c(ferme, year) ),by = "YearFarm")
+#head(insectpest.land)
+#insectpest.land$jjulien<-as.numeric(insectpest.land$jjulien)
+#ggplot(insectpest.land,aes(x=contamination,y=Avg.Num))+geom_point()+facet_wrap("year")+ #stat_smooth(method = "gam", formula = y ~ s(x), size = 1)
+#summary(lmer(Avg.Num~year+contamination+corn+(1|ferme), data=insectpest.land))
+#mod <- lmer(mean.biomasse~year+contamination+(1|ferme), data=contamination.insect.land)
+#summary(mod)
+
+##test modélisation insectes val: 2) Modélisation
+```{r, error=TRUE}
+insectpest.land <- read_xlsx("~/Documents/Etudiants/Valérie_Lemieux/insectpest.land.PCA.xlsx")
+names(insectpest.land)
+str(insectpest.land)
+insectpest.land$year<-as.factor(insectpest.land$year)
+insectpest.land$contamination<-as.numeric(insectpest.land$contamination)
+insectpest.land$count<-as.numeric(insectpest.land$count)
+insectpest.land$precipitations<-as.numeric(insectpest.land$precipitations)
+insectpest.land$jjulien<-as.numeric(insectpest.land$jjulien)
+insectpest.land <-na.omit(insectpest.land)
+str(insectpest.land)
+summary(insectpest.land)
+
+#Standardisation des données: Centrer et réduire les variables explicatives qui ont des unités différentes.
+insectpest.land.std <- data.frame(apply(insectpest.land[,c(4, 7:10)], 2, scale)) 
+colnames(insectpest.land.std) <- paste0(colnames(insectpest.land.std), ".std")
+
+insectpest.land <- data.frame(insectpest.land, insectpest.land.std)
+summary(insectpest.land)
+
+
+```
+
+
+###Construction du modèle a priori et vérification des suppositions de base
+```{r, error=TRUE}
+m1<-glmmTMB(Avg.Num ~ contamination.std + count.std + precipitations.std + year + jjulien.std + Comp.1.std +Comp.2.std+ (1|ferme), data=insectpest.land)
+summary(m1)
+
+##homogénéité de la variance
+R1 <- resid(m1)
+F1 <- fitted(m1)
+plot(x = F1, 
+     y = R1, 
+     xlab = "valeurs prédites",
+     ylab = "résidus")
+abline(h = 0, lty = 2)
+##Vérifier la normalité : histogramme
+hist(R1)
+```
+
+
+###Comparer avec et sans effets al?atoires
+```{r, error=TRUE}
+#variable dummy
+insectpest.land<-insectpest.land%>%
+  mutate(dummy=1)
+
+m1<-glmmTMB(Avg.Num ~ contamination.std + count.std + precipitations.std + year + jjulien.std + Comp.1.std +Comp.2.std+ (1|ferme), data=insectpest.land)
+m0<-glmmTMB(Avg.Num ~ contamination.std + count.std + precipitations.std + year + jjulien.std + Comp.1.std +Comp.2.std+ (1|dummy), data=insectpest.land)
+
+anova(m0,m1)
+```
+
+###Sélectionner le "meilleur" modèle (nombre de diptère)
+```{r, error=TRUE}
+#mod?le le plus complexe
+m1<-glmmTMB(Avg.Num ~ contamination.std + count.std + precipitations.std + year + jjulien.std + Comp.1 +Comp.2 + (1|ferme), data=insectpest.land)
+summary(m1)
+
+#mod?le avec la contamination/nombre de boulette (sans axe PCA)
+m2<-glmmTMB(Avg.Num ~ contamination.std + count.std + precipitations.std + year + jjulien.std + (1|ferme), data=insectpest.land)
+summary(m2)
+
+#mod?le avec axe PCA (sans contamination/nombre de boulette)
+m3<-glmmTMB(Avg.Num ~ precipitations.std + year + jjulien.std + Comp.1 +Comp.2 + (1|ferme), data=insectpest.land)
+summary(m3)
+
+#mod?le avec seulement pr?cipitation, ann?e et Jour julien
+m4<-glmmTMB(Avg.Num ~ precipitations.std + year + jjulien.std + (1|ferme), data=insectpest.land)
+summary(m4)
+
+#mod?le null
+mnull<-glmmTMB(Avg.Num ~ 1 + (1|ferme), data=insectpest.land)
+summary(mnull)
+
+list<-list(m1, m2, m3, m4, mnull)
+Model<-c("m1", "m2", "m3","m4", "mnull")
+aictab(list, modnames = Model)
+```
+
+
+Sélectionner le "meilleur" modèle (biomasse de diptère)
+```{r, error=TRUE}
+#mod?le le plus complexe
+m1<-glmmTMB(log(Avg.Bio) ~ contamination.std + count.std + precipitations.std + year + jjulien.std + Comp.1 + Comp.2 + (1|ferme), data=insectpest.land)
+summary(m1)
+
+#mod?le avec la contamination/nombre de boulette (sans axe PCA)
+m2<-glmmTMB(log(Avg.Bio) ~ contamination.std + count.std + precipitations.std + year + jjulien.std + (1|ferme), data=insectpest.land)
+summary(m2)
+
+#mod?le avec axe PCA (sans contamination/nombre de boulette)
+m3<-glmmTMB(log(Avg.Bio) ~ precipitations.std + year + jjulien.std + Comp.1 +Comp.2 + (1|ferme), data=insectpest.land)
+summary(m3)
+
+#mod?le avec seulement pr?cipitation, ann?e et Jour julien
+m4<-glmmTMB(log(Avg.Bio) ~ precipitations.std + year + jjulien.std + (1|ferme), data=insectpest.land)
+summary(m4)
+
+#mod?le null
+mnull<-glmmTMB(log(Avg.Bio) ~ 1 + (1|ferme), data=insectpest.land)
+summary(mnull)
+
+list<-list(m1, m2, m3, m4, mnull)
+Model<-c("m1", "m2", "m3","m4", "mnull")
+aictab(list, modnames = Model)
+```
+
+
+
+
+
+
+
+```{r, error=TRUE}
+
+```
+
+
+
+
+
+
+####Number of samples analyzed by year
+table(pres.abs$year)
+
+#Number of pesticides detected across all years
+sum(apply(pres.abs[,9:62], 2, sum, na.rm=T)>0)
+
+#Number of pesticides detected by year
+library(plyr)
+ddply(pres.abs, .(year), function(i) {
+sum(apply(i[,9:62], 2, sum, na.rm=T)>0)	
+})
+
+#Ppt of samples with at least one pesticide detected across all years
+num.pest.pres <- rowSums(pres.abs[, c(9:62)], na.rm=T)
+sum(num.pest.pres>0, na.rm=T)/nrow(pres.abs)
+
+#Ppt of samples with at least one pesticide detected by year
+ddply(pres.abs, .(year), function(i) {
+num.pest.pres <- rowSums(i[, c(9:62)], na.rm=T)
+sum(num.pest.pres>0, na.rm=T)/nrow(i)	
+})
+
+#Number of samples in which a given pesticide was detected across all years
+apply(pres.abs[,9:62], 2, sum, na.rm=T)
+
+#Number of samples in which a given pesticide was detected by year
+ddply(pres.abs, .(year), function(i) {
+apply(i[,9:62], 2, sum, na.rm=T)	
+})
+
+#Ppt of samples with a given pesticide across all years
+apply(pres.abs[,9:62], 2, mean, na.rm=T)
+
+#Ppt of samples with a given pesticide by year
+ddply(pres.abs, .(year), function(i) {
+apply(i[,9:62], 2, mean, na.rm=T)	
+})
+
+#Descriptive stats and distribution of number of pesticides detected in samples
+summary(num.pest.pres)
+table(num.pest.pres)
+barplot(table(num.pest.pres)/nrow(pres.abs), xlab="Nombre de pesticides détectés", ylab="Fréquence relative", cex.lab=1.5, cex.axis=1.5, cex.names=1.5)
+table(num.pest.pres)/length(pres.abs$ID2)
+
+
+####################################
+###Stats de base pour metabolites###
+####################################
+summary(num.by.group$metabolite)
+table(num.by.group$metabolite)
+
+
+###################################
+###Stats de base pour herbicides###
+###################################
+summary(num.by.group$herbicide)
+table(num.by.group$herbicide)
+
+
+#####################################
+###Stats de base pour insecticides###
+#####################################
+summary(num.by.group$insecticide)
+table(num.by.group$insecticide)
+
+
+###################################
+###Stats de base pour fongicides###
+###################################
+summary(num.by.group$fongicide)
+table(num.by.group$fongicide)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+###Détecté ou non par groupe
+li <- 9:62
+m <- match(names(pres.abs)[li],pest.liste$molecule)
+names(pres.abs)[li] <- pest.liste$type[m]
+ 
+id <- unique(names(pres.abs)[li])
+l <- lapply(id,function(i){
+  w <- which(names(pres.abs)%in%i)
+  rowSums(pres.abs[,w,drop=FALSE],na.rm=TRUE)
+})
+ 
+num.by.group <- as.data.frame(do.call("cbind",l))
+names(num.by.group) <- id
+num.by.group <- cbind(pres.abs[,setdiff(1:max(li),li)], num.by.group)
+
+head(num.by.group)
+
+
+##################################################
+###Stats de base pour l'ensemble des pesticides###
+##################################################
+
+#Type de pesticides recherchés
+table(pest.liste$type, pest.liste$famille)
+
+
+
+
+
